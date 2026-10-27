@@ -10,6 +10,9 @@
 // The epsilon of the vision tower's LayerNorms, which a vision GGUF must
 // state; unsuffixed, as SPLASH_RMS_EPSILON.
 #define SPLASH_VISION_NORM_EPSILON 1e-6
+// The epsilon of RADIO's merger RMS norm (HF's projector default; the
+// mmproj does not state it).
+#define SPLASH_VISION_MERGER_RMS_EPSILON 1e-5
 
 struct VisionGemmParams {
   uint32_t output_size;
