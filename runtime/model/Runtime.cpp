@@ -2007,6 +2007,11 @@ struct Runtime::Impl {
     draftModel->addDecode(graph, std::move(buffers),
                           targetModel->vocabularyProjection(),
                           std::span(cacheLengths).first(lanes));
+    // A LiLiCorr draft's lanes' anchor rows (DFlashDraftRingLayer::anchor).
+    std::array<MetalBuffer, kLaneCount> anchorRows{};
+    if (draftModel->lilicorr())
+      for (uint32_t lane = 0; lane < lanes; ++lane)
+        anchorRows[lane] = states.draft(laneEntry(entries, lane).stateLane)[0].anchor;
     draftModel->addSelection(
         graph,
         {d(DecodeTensor::Logits), d(DecodeTensor::TopPartialIds),
@@ -2014,7 +2019,8 @@ struct Runtime::Impl {
          d(DecodeTensor::Unary), d(DecodeTensor::SelectorHidden),
          d(DecodeTensor::SamplingUniforms), d(DecodeTensor::ProposedTokens),
          d(DecodeTensor::ProposalProbs), d(DecodeTensor::VerifyConfidence)},
-        std::span(anchors).first(lanes), std::span(policies).first(lanes));
+        std::span(anchors).first(lanes), std::span(policies).first(lanes), d(DecodeTensor::DraftFinalHidden),
+        &targetModel->tokenEmbedding(), std::span(anchorRows).first(lanes));
     ops::VerifyRowsModel verify;
     if (verifyBudget && !verifyBudget->explores(lanes, constrained)) {
       const VerifyBudget::Acceptance &acceptance = verifyBudget->acceptance();
@@ -2149,8 +2155,11 @@ struct Runtime::Impl {
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.retainedCounts = d(DecodeTensor::RetainedCount);
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
+    if (draftModel->lilicorr())
+      for (uint32_t lane = 0; lane < lanes; ++lane)
+        buffers.anchors[lane] = states.draft(laneEntry(entries, lane).stateLane)[0].anchor;
     draftModel->addContextCommit(graph, std::move(buffers),
-                                 std::span(startPositions).first(lanes));
+                                std::span(startPositions).first(lanes));
   }
 
   void encodeBatchAcceptance(CommandGraph &graph,

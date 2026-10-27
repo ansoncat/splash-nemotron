@@ -4,6 +4,7 @@
 #include "WeightStore.hpp"
 #include "metal/abi/DraftAttention.h"
 #include "metal/abi/ExecutionGeometry.h"
+#include "metal/abi/LiLiCorr.h"
 #include "metal/abi/PagedAttention.h"
 #include "ops/MoE.hpp"
 
@@ -672,8 +673,14 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
                   {"num_attention_heads", SPLASH_DRAFT_QUERY_HEADS},
                   {"num_key_value_heads", SPLASH_DRAFT_KV_HEADS},
                   {"head_dim", SPLASH_DRAFT_HEAD_DIMENSION},
-                  {"sliding_window", ExecutionLimits::draftContextTokens},
                   {"rms_norm_eps", SPLASH_RMS_EPSILON}});
+  // The positions a query row sees: the ring's, or a LiLiCorr draft's 1024,
+  // whose attention may add a sink logit per query head.
+  const uint32_t slidingWindow = requireWhole(draft[@"sliding_window"], "draft config sliding_window");
+  if (slidingWindow != ExecutionLimits::draftContextTokens && slidingWindow != 1024)
+    throw std::invalid_argument("draft config sliding_window is neither " +
+                                std::to_string(ExecutionLimits::draftContextTokens) + " nor 1024");
+  const bool attentionSinks = [draft[@"attention_sink_bias"] isEqual:@YES];
   requireBooleans(draft, "draft config",
                   {{"is_causal", false},
                    {"attention_bias", false},
@@ -717,12 +724,25 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
     if (targetLayers.back() >= target.layers)
       throw std::invalid_argument("draft config target_layer_ids names a layer past the target's");
   }
-  const DFlashDraftLayout layout =
+  DFlashDraftLayout layout =
       draftLayout(target.hiddenSize, target.vocabularySize,
                   requireWhole(draft[@"num_hidden_layers"], "draft config num_hidden_layers"),
                   requireWhole(draft[@"intermediate_size"], "draft config intermediate_size"),
                   requireNumber(rope[@"rope_theta"], "draft config rope_parameters rope_theta").floatValue,
                   targetLayers);
+  layout.slidingWindow = slidingWindow;
+  layout.attentionSinks = attentionSinks;
+  // A LiLiCorr selector (metal/abi/LiLiCorr.h) in place of the codebooks.
+  if (flash[@"projector_type"]) {
+    requireEqual(requireString(flash, @"projector_type", "draft config projector_type"), "lilicorr",
+                 "checkpoint", "draft config dflash_config projector_type");
+    requireNumbers(flash, "checkpoint", "draft config dflash_config",
+                   {{"lilicorr_candidate_topk", SPLASH_LILICORR_CANDIDATES},
+                    {"lilicorr_hidden_size", SPLASH_LILICORR_HIDDEN},
+                    {"lilicorr_num_heads", SPLASH_LILICORR_HEADS},
+                    {"lilicorr_num_layers", SPLASH_LILICORR_LAYERS}});
+    layout.lilicorr = true;
+  }
   return layout;
 }
 

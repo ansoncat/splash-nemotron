@@ -455,6 +455,8 @@ public:
 
   [[nodiscard]] const ops::Projection &
   vocabularyProjection() const noexcept;
+  // The target's token table, which a LiLiCorr draft's selector reads.
+  [[nodiscard]] const ops::EmbeddingWeights &tokenEmbedding() const noexcept;
   // Lanes of storage the tensors of a decode step of `lanes` lanes bind: a
   // linear tile may hold more rows than the step (LinearPlan::storageRows;
   // a three-lane GGUF step on the staged tile runs its 32-row tile over four

@@ -356,6 +356,7 @@ void QwenStateStorage::clearDraftRings(uint32_t index) {
   for (const DFlashDraftRingLayer &layer : target.cells.draft->layers()) {
     clear(layer.keys, "draft ring keys");
     clear(layer.values, "draft ring values");
+    if (layer.anchor) clear(layer.anchor, "draft anchor");
   }
 }
 
