@@ -88,12 +88,14 @@ PAGED_PREFILL_SPLIT(prefill_attention_q8_split_kv2_g16, 2, 16, 256, 0, int8_t)
 // of the 512 keys before each row.
 PAGED_PREFILL_SPLIT(prefill_attention_q8_split_kv4_g8_d128, 4, 8, 128, 0, int8_t)
 PAGED_PREFILL_SPLIT(prefill_attention_q8_split_kv4_g8_d128_w512, 4, 8, 128, 512, int8_t)
+PAGED_PREFILL_SPLIT(prefill_attention_q8_split_kv2_g16_d128, 2, 16, 128, 0, int8_t)
 // BF16 shares the page loop and reduction, without quantization scales.
 PAGED_PREFILL_SPLIT(prefill_attention_bf16_split, 4, 6, 256, 0, bfloat)
 PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g8, 2, 8, 256, 0, bfloat)
 PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g16, 2, 16, 256, 0, bfloat)
 PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv4_g8_d128, 4, 8, 128, 0, bfloat)
 PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 512, bfloat)
+PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv2_g16_d128, 2, 16, 128, 0, bfloat)
 #undef PAGED_PREFILL_SPLIT
 
 #define PAGED_PREFILL_REDUCE(Name, Heads, Group, HeadDim, Window)              \
@@ -131,6 +133,7 @@ PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 51
 PAGED_PREFILL_REDUCE(prefill_attention_reduce, 4, 6, 256, 0)
 PAGED_PREFILL_REDUCE(prefill_attention_reduce_kv2_g8, 2, 8, 256, 0)
 PAGED_PREFILL_REDUCE(prefill_attention_reduce_kv2_g16, 2, 16, 256, 0)
+PAGED_PREFILL_REDUCE(prefill_attention_reduce_kv2_g16_d128, 2, 16, 128, 0)
 PAGED_PREFILL_SINK_REDUCE(prefill_attention_reduce_kv4_g8_d128_sinks, 4, 8, 128, 0)
 PAGED_PREFILL_SINK_REDUCE(prefill_attention_reduce_kv4_g8_d128_w512_sinks, 4, 8, 128, 512)
 #undef PAGED_PREFILL_SINK_REDUCE

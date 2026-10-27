@@ -49,6 +49,25 @@
         chunk_values, params, reductions, normalized, task, thread_index,     \
         lane, simd_group);                                                    \
   }
+// A geometry without q/k norms (NoPE as well) binds neither norms nor tables.
+#define PREFILL_ATTENTION_QKV_UNNORMED(Name, QHeads, KHeads, HeadDim)         \
+  kernel void Name(                                                           \
+      device const bfloat *qkv [[buffer(0)]],                                 \
+      device bfloat *queries [[buffer(1)]],                                   \
+      device bfloat *chunk_keys [[buffer(2)]],                                \
+      device bfloat *chunk_values [[buffer(3)]],                              \
+      constant FullPrefillParams &params [[buffer(4)]],                       \
+      uint task [[threadgroup_position_in_grid]],                             \
+      uint thread_index [[thread_index_in_threadgroup]],                      \
+      uint lane [[thread_index_in_simdgroup]],                                \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) {                   \
+    threadgroup float reductions[HeadDim / 32];                               \
+    threadgroup bfloat normalized[HeadDim];                                   \
+    full_qkv_storage_phase<QHeads, KHeads, HeadDim, 0, false, bfloat, false>( \
+        qkv, nullptr, nullptr, nullptr, nullptr, queries, chunk_keys,         \
+        chunk_values, params, reductions, normalized, task, thread_index,     \
+        lane, simd_group);                                                    \
+  }
 PREFILL_ATTENTION_QKV(prefill_attention_qkv, 24, 4, 256, 32, true, bfloat)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv2_g8, 16, 2, 256, 32, true, bfloat)
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_f32, 24, 4, 256, 32, true, float)
@@ -63,6 +82,9 @@ PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv4_g8_d128, 32, 4, 128, 64, false, 
 PREFILL_ATTENTION_QKV(prefill_attention_qkv_kv4_g8_d128_f32, 32, 4, 128, 64, false, float)
 PREFILL_ATTENTION_QKV_NOPE(prefill_attention_qkv_kv4_g8_d128_nope, 32, 4, 128, false, bfloat)
 PREFILL_ATTENTION_QKV_NOPE(prefill_attention_qkv_kv4_g8_d128_nope_f32, 32, 4, 128, false, float)
+// Two KV heads of 128 dimensions without q/k norms, RoPE or an output gate.
+PREFILL_ATTENTION_QKV_UNNORMED(prefill_attention_qkv_kv2_g16_d128_nope, 32, 2, 128)
+#undef PREFILL_ATTENTION_QKV_UNNORMED
 #undef PREFILL_ATTENTION_QKV_NOPE
 #undef PREFILL_ATTENTION_QKV
 
@@ -105,4 +127,5 @@ PREFILL_ATTENTION_GATE(prefill_attention_gate_kv2_g16, 32, 2, 256)
         nullptr, attention, hidden, params, index, grid_size);                 \
   }
 PREFILL_ATTENTION_GATHER(prefill_attention_gather_kv4_g8_d128, 32, 4, 128)
+PREFILL_ATTENTION_GATHER(prefill_attention_gather_kv2_g16_d128, 32, 2, 128)
 #undef PREFILL_ATTENTION_GATHER

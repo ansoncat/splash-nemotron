@@ -3,7 +3,7 @@
 #include "metal/kernels/common/attention_gate.h"
 #include "metal/kernels/common/attention_qkv_prepare.h"
 
-template <uint QHeads, uint KHeads, uint HeadDim, uint RotaryPairs, bool Gated, class W>
+template <uint QHeads, uint KHeads, uint HeadDim, uint RotaryPairs, bool Gated, class W, bool Normed = true>
 inline void full_qkv_decode_phase(
     device const bfloat *qkv, device const W *q_norm,
     device const W *k_norm, device const float *rope_cos,
@@ -18,7 +18,7 @@ inline void full_qkv_decode_phase(
   uint batch = group.y;
   constexpr ulong kv_lane_stride = ulong(KHeads) * Stride * HeadDim;
   FullPrefillParams lane_params{Rows, Stride};
-  full_qkv_storage_phase<QHeads, KHeads, HeadDim, RotaryPairs, Gated>(
+  full_qkv_storage_phase<QHeads, KHeads, HeadDim, RotaryPairs, Gated, W, Normed>(
       qkv + ulong(batch) * Rows * PackedStride, q_norm, k_norm,
       rope_cos + ulong(batch) * Rows * RotaryPairs,
       rope_sin + ulong(batch) * Rows * RotaryPairs,
@@ -69,6 +69,22 @@ inline void full_qkv_decode_phase(
         qkv, q_norm, k_norm, nullptr, nullptr, queries, keys, values,         \
         reductions, normalized, group, thread_index, lane, simd_group);       \
   }
+// A geometry without q/k norms (NoPE as well) binds neither norms nor tables.
+#define VERIFY_ATTENTION_QKV_UNNORMED(Name, QHeads, KHeads, HeadDim)          \
+  kernel void Name(                                                           \
+      device const bfloat *qkv [[buffer(0)]],                                 \
+      device bfloat *queries [[buffer(1)]], device bfloat *keys [[buffer(2)]], \
+      device bfloat *values [[buffer(3)]],                                    \
+      uint2 group [[threadgroup_position_in_grid]],                           \
+      uint thread_index [[thread_index_in_threadgroup]],                      \
+      uint lane [[thread_index_in_simdgroup]],                                \
+      uint simd_group [[simdgroup_index_in_threadgroup]]) {                   \
+    threadgroup float reductions[HeadDim / 32];                               \
+    threadgroup bfloat normalized[HeadDim];                                   \
+    full_qkv_decode_phase<QHeads, KHeads, HeadDim, 0, false, bfloat, false>(  \
+        qkv, nullptr, nullptr, nullptr, nullptr, queries, keys, values,       \
+        reductions, normalized, group, thread_index, lane, simd_group);       \
+  }
 VERIFY_ATTENTION_QKV(verify_attention_qkv, 24, 4, 256, 32, true, bfloat)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv2_g8, 16, 2, 256, 32, true, bfloat)
 VERIFY_ATTENTION_QKV(verify_attention_qkv_f32, 24, 4, 256, 32, true, float)
@@ -83,6 +99,9 @@ VERIFY_ATTENTION_QKV(verify_attention_qkv_kv4_g8_d128, 32, 4, 128, 64, false, bf
 VERIFY_ATTENTION_QKV(verify_attention_qkv_kv4_g8_d128_f32, 32, 4, 128, 64, false, float)
 VERIFY_ATTENTION_QKV_NOPE(verify_attention_qkv_kv4_g8_d128_nope, 32, 4, 128, false, bfloat)
 VERIFY_ATTENTION_QKV_NOPE(verify_attention_qkv_kv4_g8_d128_nope_f32, 32, 4, 128, false, float)
+// Two KV heads of 128 dimensions without q/k norms, RoPE or an output gate.
+VERIFY_ATTENTION_QKV_UNNORMED(verify_attention_qkv_kv2_g16_d128_nope, 32, 2, 128)
+#undef VERIFY_ATTENTION_QKV_UNNORMED
 #undef VERIFY_ATTENTION_QKV_NOPE
 #undef VERIFY_ATTENTION_QKV
 
@@ -138,6 +157,7 @@ VERIFY_ATTENTION_GATE(verify_attention_gate_kv2_g16, 32, 2, 256)
         nullptr, attention, hidden, params, index, grid_size);                 \
   }
 VERIFY_ATTENTION_GATHER(verify_attention_gather_kv4_g8_d128, 32, 4, 128)
+VERIFY_ATTENTION_GATHER(verify_attention_gather_kv2_g16_d128, 32, 2, 128)
 #undef VERIFY_ATTENTION_GATHER
 
 #define ATTENTION_GATE_TABLE(Name, QHeads, KHeads, HeadDim, Layout) \
@@ -181,4 +201,5 @@ ATTENTION_GATE_TABLE(verify_attention_gate_table16_kv2_g16, 32, 2, 256, gguf_sg:
                   width, (element % width) / 64, row % 8, lane, a, b); \
   }
 ATTENTION_GATHER_TABLE(verify_attention_gather_table16_kv4_g8_d128, 32, 4, 128, gguf_sg::Table16)
+ATTENTION_GATHER_TABLE(verify_attention_gather_table16_kv2_g16_d128, 32, 2, 128, gguf_sg::Table16)
 #undef ATTENTION_GATHER_TABLE
