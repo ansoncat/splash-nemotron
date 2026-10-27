@@ -41,10 +41,8 @@ model::DFlashDraftLayout draftOf(std::string_view family) {
     return test::flashNextDraft();
   if (family == model::FlintLayout{}.family)
     return test::flintDraft();
-  // Nemotron-H is served without a DFlash2 draft of its own: its
-  // values are a model's without one.
   if (family == model::NemotronHLayout{}.family)
-    return {};
+    return test::nemotronBoltDraft();
   throw std::logic_error(std::string(family) + " has no draft to take its values with");
 }
 
