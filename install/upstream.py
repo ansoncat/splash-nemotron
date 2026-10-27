@@ -27,7 +27,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import assembly, families, gguf, hub, models
+from . import assembly, dflash_gguf, families, gguf, hub, models
 
 # The tokenizer files an MLX target may supply, linked when present.
 TOKENIZER_FILES = (
@@ -667,6 +667,9 @@ def publish(models_root, link, record, files):
             )
             files = files | derived
             records |= _file_records(previous, derived.values())
+        derived = assembly.derived_draft(models_root, files, records)
+        files = files | derived
+        records |= _file_records(previous, derived.values())
         record["files"] = {name: records[path] for name, path in sorted(files.items())}
         # A new installation requires its pins before it is published; its
         # older pins are retired once it is, in the repositories the
@@ -718,6 +721,12 @@ def _changes(installed, family, draft):
         "metadata"
     ] != assembly.metadata_key(installed["files"]):
         changes.append("the GGUF metadata adapter changed")
+    key = assembly.draft_key(installed["files"])
+    if (
+        key
+        and f"/.metadata/{key}/" not in installed["files"]["draft/config.json"]["path"]
+    ):
+        changes.append("the draft converter changed")
     return changes
 
 
@@ -802,6 +811,9 @@ def draft_files(repo, target):
     download only once the engine accepts its configuration with the
     target's (check_model)."""
     family = target.family
+    ggufs = sorted(n for n in repo.files if "/" not in n and n.endswith(".gguf"))
+    if "config.json" not in repo.files and len(ggufs) == 1:
+        return _gguf_draft(repo, ggufs[0], target)
     try:
         if "config.json" not in repo.files:
             raise models.ModelError("no config.json")
@@ -811,7 +823,13 @@ def draft_files(repo, target):
             f"{repo.name} does not contain a DFlash2 checkpoint for {family.name}"
             f" ({error})"
         ) from error
-    config = repo.file("config.json")
+    _check_draft(repo, target, repo.file("config.json"))
+    mask = {DRAFT_MASK_EMBEDDING} & set(repo.files)
+    downloaded = repo.download({"config.json", *weights, *mask})
+    return {"draft/" + name: path for name, path in downloaded.items()}
+
+
+def _check_draft(repo, target, config):
     try:
         check_model(
             target.format,
@@ -822,9 +840,24 @@ def draft_files(repo, target):
         )
     except models.ModelError as error:
         raise models.ModelError(
-            f"{repo.name}'s draft configuration is incompatible with {family.name}: "
-            f"{error}"
+            f"{repo.name}'s draft configuration is incompatible with "
+            f"{target.family.name}: {error}"
         ) from error
-    mask = {DRAFT_MASK_EMBEDDING} & set(repo.files)
-    downloaded = repo.download({"config.json", *weights, *mask})
-    return {"draft/" + name: path for name, path in downloaded.items()}
+
+
+def _gguf_draft(repo, name, target):
+    """A draft released as a LiLiCorr GGUF, the one GGUF of repo: its
+    configuration, derived from its header, checked before the download;
+    publish derives its checkpoint (assembly.derived_draft)."""
+    with repo.open(name) as stream:
+        header = gguf.Metadata(stream)
+    try:
+        config = dflash_gguf.config_bytes(header)
+    except models.ModelError as error:
+        raise models.ModelError(f"{repo.name}'s {name}: {error}") from error
+    with tempfile.TemporaryDirectory(prefix="splash-draft-") as scratch:
+        path = Path(scratch) / "config.json"
+        path.write_bytes(config)
+        _check_draft(repo, target, path)
+    downloaded = repo.download({name})
+    return {"draft/" + name: downloaded[name]}

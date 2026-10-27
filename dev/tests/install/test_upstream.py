@@ -74,9 +74,6 @@ class UpstreamTest(unittest.TestCase):
         for family in families.FAMILIES:
             if family in GGUF_ONLY:
                 continue
-            # Nemotron-H has no installer fixtures yet.
-            if family.name == "Nemotron-3.5-Bolt":
-                continue
             config = mlx_target(self.root / family.name, family) / "config.json"
             draft = draft_dir(self.root / family.name / "draft", family)
             for arguments in ({}, {"draft": draft / "config.json"}):
@@ -86,11 +83,12 @@ class UpstreamTest(unittest.TestCase):
                     ),
                     family,
                 )
-        # Qwen3.8-Flash-Next and Flint load from a GGUF: the config and
-        # metadata the installer derives from it name the family, with and
-        # without its draft (Flint's flat config, its release's keys, and a
-        # test draft naming one of its reserved tokens as its mask), and
-        # another family's draft is refused.
+        # Qwen3.8-Flash-Next, Flint and Nemotron 3.5 Bolt load from a GGUF:
+        # the config and metadata the installer derives from it name the
+        # family, with and without its draft (Flint's flat config, its
+        # release's keys, and a test draft naming one of its reserved tokens
+        # as its mask; Bolt's, the config converted from its LiLiCorr GGUF),
+        # and another family's draft is refused.
         for family in GGUF_ONLY:
             configs = CONFIGS / family.name.lower()
             gguf_check = {"gguf_metadata": configs / "gguf-metadata.json"}

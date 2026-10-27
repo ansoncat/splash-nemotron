@@ -19,10 +19,11 @@ class ModelFamily:
     # runtime/model/Qwen3_8.hpp, Qwen3_6Moe.hpp, Qwen4Exp.hpp, Flint.hpp and NemotronH.hpp).
     name: str
     # The repository of the DFlash2 draft released for the family, as its
-    # release publishes it (config.json and BF16 safetensors). Installations
-    # follow its default branch as they follow the target's. None while no
-    # draft is released for the family: an installation names one with
-    # --draft-model.
+    # release publishes it (config.json and BF16 safetensors), or as one
+    # LiLiCorr GGUF, which installations convert (dflash_gguf.py).
+    # Installations follow its default branch as they follow the target's.
+    # None while no draft is released for the family: an installation names
+    # one with --draft-model.
     draft_repo: str | None
     # How the family's model reasons and calls tools, and the tokens it
     # shares with the engine (server/chat_format.py).
@@ -46,10 +47,15 @@ FAMILIES = (
     ModelFamily("Qwen3.8-Flash-Next", "incoai/Qwen3.8-Flash-Next-DFlash2", QWEN),
     # It has no vision tower.
     ModelFamily("Flint", "incoai/Flint-DFlash2", FLINT, vision=False),
-    # No DFlash2 draft is released for it (LiLiCorr is converted). Its RADIO
-    # tower loads from a GGUF projector only. Its Mamba-2 state is fp32 only
-    # (runtime/model/NemotronHTarget.cpp).
-    ModelFamily("Nemotron-3.5-Bolt", None, NEMOTRON, state_formats=("fp32",)),
+    # Its LiLiCorr draft is released as a GGUF only. Its
+    # RADIO tower loads from a GGUF projector only. Its Mamba-2 state is
+    # fp32 only (runtime/model/NemotronHTarget.cpp).
+    ModelFamily(
+        "Nemotron-3.5-Bolt",
+        "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr-GGUF",
+        NEMOTRON,
+        state_formats=("fp32",),
+    ),
 )
 
 
