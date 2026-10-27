@@ -127,6 +127,17 @@ class ChatFormat:
     # The template's special token after which prompt tokenization reuses a
     # cached prompt's tokens (tokenization.PromptTokenizer).
     message_boundary: str
+    # The token the template writes for an image, one token of its tokenizer,
+    # which the server widens to the image's merged tokens, between
+    # image_open and image_close where the family's processor wraps them.
+    image_pad: str = "<|image_pad|>"
+    image_open: str = ""
+    image_close: str = ""
+    # Where the template's source writes image_pad for an image, as opposed to
+    # testing a message's text for it (frontend._render_image_tokens).
+    image_sites: tuple[str, ...] = ("<|image_pad|>",)
+    # How its processor resizes an image (images.RESIZE_RULES).
+    image_resize: str = "qwen"
 
     @property
     def stop_ids(self):
@@ -184,7 +195,9 @@ FLINT = ChatFormat(
 # Nemotron-H's (Nemotron 3.5 Bolt, runtime/model/NemotronH.hpp): the
 # tekken vocabulary, </s> and the turn end <|im_end|> as stop tokens, and a
 # ChatML template that opens the think block by enable_thinking and lays a
-# call out as Qwen's do.
+# call out as Qwen's do. Its template writes <image> for an image, which its
+# processor (processing.py) widens between <img> and </img>; the template
+# also tests a message's text for <image>.
 NEMOTRON = ChatFormat(
     vocabulary=131072,
     stop_tokens=(("</s>", 2), ("<|im_end|>", 11)),
@@ -193,4 +206,9 @@ NEMOTRON = ChatFormat(
     call_open_id=14,
     call_syntax=QWEN_XML,
     message_boundary="<|im_end|>",
+    image_pad="<image>",
+    image_open="<img>",
+    image_close="</img>",
+    image_sites=("+ '<image>'", "'><image>'"),
+    image_resize="nemotron",
 )

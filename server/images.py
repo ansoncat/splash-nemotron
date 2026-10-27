@@ -27,6 +27,10 @@ MAX_PIXELS = 4_194_304
 MAX_SOURCE_PIXELS = 32 * 1024 * 1024
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 IMAGE_FORMATS = ("JPEG", "PNG", "WEBP", "GIF")
+# Nemotron Omni's processor (Nemotron 3.5 Bolt): each image's patches
+# within these bounds.
+NEMOTRON_MIN_PATCHES = 1024
+NEMOTRON_MAX_PATCHES = 13312
 
 
 class ImageError(ValueError):
@@ -103,16 +107,91 @@ def smart_resize(height: int, width: int, max_pixels: int) -> tuple[int, int]:
     return h_bar, w_bar
 
 
-def prepare(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedImage:
+def nemotron_resize(height: int, width: int, max_pixels: int) -> tuple[int, int]:
+    """Nemotron Omni's _compute_target_patches: about one patch per 16 pixels,
+    scaled down into the patch budget or up to its minimum, then each side
+    rounded to whole merge units. The serving cap bounds the budget and, as
+    in smart_resize, takes precedence over the minimum."""
+    if height <= 0 or width <= 0:
+        raise ImageError("image dimensions must be positive")
+    if not MIN_PIXELS <= max_pixels <= MAX_PIXELS:
+        raise ImageError("invalid image pixel budget")
+    if max(height, width) / min(height, width) > 200:
+        raise ImageError("absolute aspect ratio must be smaller than 200")
+    budget = min(max_patches(max_pixels), NEMOTRON_MAX_PATCHES)
+    # Upstream's own rounding, ties to even: a whole odd count of patches
+    # gains one.
+    rows, cols = round(height / PATCH + 0.5), round(width / PATCH + 0.5)
+    factor = min(math.sqrt(budget / (rows * cols)), 1.0)
+    rows, cols = math.floor(factor * rows), math.floor(factor * cols)
+    if budget > NEMOTRON_MIN_PATCHES and rows * cols < NEMOTRON_MIN_PATCHES:
+        up = math.sqrt(NEMOTRON_MIN_PATCHES / (rows * cols))
+        rows, cols = math.ceil(up * rows), math.ceil(up * cols)
+    if rows % MERGE:
+        if (rows + MERGE - rows % MERGE) * cols <= budget:
+            rows += MERGE - rows % MERGE
+        else:
+            rows = max(MERGE, rows - rows % MERGE)
+    if cols % MERGE:
+        if rows * (cols + MERGE - cols % MERGE) <= budget:
+            cols += MERGE - cols % MERGE
+        else:
+            cols = max(MERGE, cols - cols % MERGE)
+    # The minimum's ceilings can overshoot a budget just above it.
+    while rows * cols > budget:
+        if rows >= cols:
+            rows -= MERGE
+        else:
+            cols -= MERGE
+    return rows * PATCH, cols * PATCH
+
+
+def resize_rgb(image, width: int, height: int):
+    from PIL import Image
+
+    return image.resize((width, height), Image.Resampling.BICUBIC)
+
+
+def resize_float(image, width: int, height: int):
+    """Antialiased bicubic on float pixels, rounded once: within 0.03 levels
+    of torch's interpolate(antialias=True), which Nemotron Omni's processor
+    resizes with. Pillow's RGB path rounds between its passes, up to 4 levels
+    off it."""
+    from PIL import Image
+
+    return Image.merge(
+        "RGB",
+        [
+            channel.convert("F")
+            .resize((width, height), Image.Resampling.BICUBIC)
+            .point(lambda value: value + 0.5)
+            .convert("L")  # Truncates and clamps: rounds half up.
+            for channel in image.split()
+        ],
+    )
+
+
+# Each family's resize rule (ChatFormat.image_resize): its target size, and
+# how it resizes to it.
+RESIZE_RULES = {
+    "qwen": (smart_resize, resize_rgb),
+    "nemotron": (nemotron_resize, resize_float),
+}
+
+
+def prepare(
+    payload: bytes, max_pixels: int = MAX_PIXELS, rule: str = "qwen"
+) -> PreparedImage:
     """Decode, convert to RGB, resize into the grid, and digest the pixels."""
     from PIL import Image, ImageOps
 
+    target, resize = RESIZE_RULES[rule]
     try:
         with Image.open(io.BytesIO(payload), formats=IMAGE_FORMATS) as decoded:
             if decoded.height * decoded.width > MAX_SOURCE_PIXELS:
                 raise ImageError("source image exceeds the pixel limit")
             stored = decoded.size
-            height, width = smart_resize(decoded.height, decoded.width, max_pixels)
+            height, width = target(decoded.height, decoded.width, max_pixels)
             try:
                 # Cameras store the sensor's orientation and an EXIF tag that
                 # turns it upright for display; show the model the upright one.
@@ -130,7 +209,7 @@ def prepare(payload: bytes, max_pixels: int = MAX_PIXELS) -> PreparedImage:
             else:
                 image = decoded.convert("RGB")
             if (image.height, image.width) != (height, width):
-                image = image.resize((width, height), Image.Resampling.BICUBIC)
+                image = resize(image, width, height)
             pixels = image.tobytes()
     except ImageError:
         raise
@@ -186,13 +265,17 @@ class ImageCache:
     def request_batch(self):
         return PreparedImages(self)
 
-    def prepare(self, payload: bytes, max_pixels: int) -> PreparedImage:
-        key = hashlib.sha256(struct.pack("<I", max_pixels) + payload).digest()
+    def prepare(
+        self, payload: bytes, max_pixels: int, rule: str = "qwen"
+    ) -> PreparedImage:
+        key = hashlib.sha256(
+            struct.pack("<I", max_pixels) + rule.encode() + b"\0" + payload
+        ).digest()
         with self._lock:
             cached = self._entries.get(key)
         if cached is not None:
             return cached
-        prepared = prepare(payload, max_pixels)
+        prepared = prepare(payload, max_pixels, rule)
         with self._lock:
             self._entries.put(key, prepared, len(prepared.pixels))
         return prepared

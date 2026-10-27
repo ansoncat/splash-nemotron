@@ -11,7 +11,6 @@ from .errors import APIError
 from .metrics import timings_dict, usage_dict
 from .tool_schema import TAG_NAME_RULE, is_tag_name
 
-IMAGE_PAD_TOKEN = "<|image_pad|>"
 VISION_UNAVAILABLE = (
     "this model is serving without vision (started with --language-only)"
 )

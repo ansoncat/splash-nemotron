@@ -15,7 +15,6 @@ from . import images as image_input
 from . import json_codec, judgments
 from . import protocol as wire
 from .api_shapes import (
-    IMAGE_PAD_TOKEN,
     canonical_responses_input,
     normalize_messages,
     responses_to_chat_body,
@@ -374,7 +373,9 @@ class Frontend:
             remaining_request_time(deadline)
             try:
                 payload = image_input.decode_data_url(part["image_url"]["url"])
-                image = self.images.prepare(payload, self.max_image_pixels)
+                image = self.images.prepare(
+                    payload, self.max_image_pixels, self.chat_format.image_resize
+                )
                 tokens += image.tokens
                 pixel_bytes += len(image.pixels)
                 self._check_image_request_size(
@@ -423,24 +424,21 @@ class Frontend:
         each real image to its placeholder even when a coding agent has read
         documentation or source containing literal vision tokens.
         """
+        pad = self.chat_format.image_pad
+        source = template["chat_template"]
+        for site in self.chat_format.image_sites:
+            source = source.replace(site, site.replace(pad, IMAGE_RENDER_MARKER))
         rendered = self._apply_chat_template(
-            messages,
-            {
-                **template,
-                "tokenize": False,
-                "chat_template": template["chat_template"].replace(
-                    IMAGE_PAD_TOKEN, IMAGE_RENDER_MARKER
-                ),
-            },
+            messages, {**template, "tokenize": False, "chat_template": source}
         )
         parts = rendered.split(IMAGE_RENDER_MARKER)
         image_offsets = set()
         offset = 0
         for part in parts[:-1]:
             offset += len(part)
-            image_offsets.add((offset, offset + len(IMAGE_PAD_TOKEN)))
-            offset += len(IMAGE_PAD_TOKEN)
-        rendered = IMAGE_PAD_TOKEN.join(parts)
+            image_offsets.add((offset, offset + len(pad)))
+            offset += len(pad)
+        rendered = pad.join(parts)
         encoded = self._tokenize(
             rendered,
             add_special_tokens=False,
@@ -453,13 +451,22 @@ class Frontend:
         ]
         return list(encoded["input_ids"]), positions, rendered
 
+    def _image_wrap(self):
+        """The tokens before and after each image's pads: its family's open
+        and close, if any."""
+        return [
+            [self.tokenizer.convert_tokens_to_ids(tag)] if tag else []
+            for tag in (self.chat_format.image_open, self.chat_format.image_close)
+        ]
+
     def _image_token_count(self, prompt_tokens, prepared, positions):
-        pad_id = self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN)
+        pad_id = self.tokenizer.convert_tokens_to_ids(self.chat_format.image_pad)
         if len(positions) != len(prepared) or any(
             prompt_tokens[position] != pad_id for position in positions
         ):
             raise APIError(400, "image count does not match the rendered template")
-        return len(prompt_tokens) + sum(image.tokens - 1 for image in prepared)
+        wrap = sum(map(len, self._image_wrap()))
+        return len(prompt_tokens) + sum(image.tokens - 1 + wrap for image in prepared)
 
     def _expand_image_pads(self, prompt_tokens, prepared, positions):
         """Widens the template's single placeholder per image to the image's
@@ -473,9 +480,11 @@ class Frontend:
             sum(len(image.pixels) for image in prepared),
         )
         expanded, spans, cursor = [], [], 0
-        pad_id = self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN)
+        pad_id = self.tokenizer.convert_tokens_to_ids(self.chat_format.image_pad)
+        image_open, image_close = self._image_wrap()
         for position, image in zip(positions, prepared):
             expanded.extend(prompt_tokens[cursor:position])
+            expanded.extend(image_open)
             spans.append(
                 wire.ImageSpan(
                     len(expanded),
@@ -487,6 +496,7 @@ class Frontend:
                 )
             )
             expanded.extend([pad_id] * image.tokens)
+            expanded.extend(image_close)
             cursor = position + 1
         expanded.extend(prompt_tokens[cursor:])
         pixels = b"".join(image.pixels for image in prepared)
@@ -958,8 +968,11 @@ class Frontend:
                 prompt.messages, deadline, check_context=check_context
             )
         remaining_request_time(deadline)
-        if images and self.tokenizer.convert_tokens_to_ids(IMAGE_PAD_TOKEN) is None:
-            raise APIError(400, "the tokenizer does not define the image pad token")
+        if images and None in (
+            self.tokenizer.convert_tokens_to_ids(self.chat_format.image_pad),
+            *sum(self._image_wrap(), []),
+        ):
+            raise APIError(400, "the tokenizer does not define the image tokens")
         positions = []
         try:
             if images:

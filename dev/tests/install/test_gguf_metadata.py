@@ -842,6 +842,37 @@ class GgufMetadataTests(unittest.TestCase):
         )
         self.assertEqual(derived["vision_config"]["num_position_embeddings"], 16384)
 
+    def test_radio_processor_is_nemotron_omnis(self):
+        values = vision_fixture() | {
+            "clip.projector_type": "nemotron_omni",
+            "clip.vision.projector.scale_factor": 2,
+            "clip.vision.image_mean": [0.48145466, 0.4578275, 0.40821073],
+            "clip.vision.image_std": [0.26862954, 0.26130258, 0.27577711],
+        }
+        families_by_name = {family.name: family for family in families.FAMILIES}
+        nemotron = families_by_name["Nemotron-3.5-Bolt"]
+        qwen = families_by_name["Qwen3.8-27B"]
+
+        def processor(values):
+            path = fixture_files.write_gguf(
+                self.root / "radio.gguf",
+                values,
+                [("v.position_embd.weight", [1152, 16384], 0, b"")],
+            )
+            return gguf.processor_config(gguf.Metadata(path, tensors=True))
+
+        # As float32, as the projector stores them.
+        upstream._validate_processor(processor(values), nemotron)
+        for family, values in (
+            (qwen, values),
+            (nemotron, values | {"clip.vision.image_mean": [0.5] * 3}),
+        ):
+            with (
+                self.subTest(family=family.name),
+                self.assertRaisesRegex(models.ModelError, "unsupported vision"),
+            ):
+                upstream._validate_processor(processor(values), family)
+
     def derived(self, models_root, path):
         """The metadata derived from a target GGUF, as installations derive
         it, under the lock."""

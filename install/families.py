@@ -46,12 +46,10 @@ FAMILIES = (
     ModelFamily("Qwen3.8-Flash-Next", "incoai/Qwen3.8-Flash-Next-DFlash2", QWEN),
     # It has no vision tower.
     ModelFamily("Flint", "incoai/Flint-DFlash2", FLINT, vision=False),
-    # No DFlash2 draft is released for it (LiLiCorr is converted); it serves
-    # text only. Its Mamba-2 state is fp32 only
+    # No DFlash2 draft is released for it (LiLiCorr is converted). Its RADIO
+    # tower loads from a GGUF projector only. Its Mamba-2 state is fp32 only
     # (runtime/model/NemotronHTarget.cpp).
-    ModelFamily(
-        "Nemotron-3.5-Bolt", None, NEMOTRON, vision=False, state_formats=("fp32",)
-    ),
+    ModelFamily("Nemotron-3.5-Bolt", None, NEMOTRON, state_formats=("fp32",)),
 )
 
 

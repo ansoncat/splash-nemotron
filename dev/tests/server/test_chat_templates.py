@@ -12,6 +12,7 @@ from transformers import PreTrainedTokenizerFast
 from dev.tests import server_fixtures as fixtures
 from server import api_shapes, chat_templates
 from server import frontend as request_frontend
+from server.chat_format import QWEN
 from server.chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
     NATIVE,
@@ -561,9 +562,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         # Image rendering swaps the pad token for a marker in that template.
         chosen_sources = {
             chosen.source,
-            chosen.source.replace(
-                api_shapes.IMAGE_PAD_TOKEN, request_frontend.IMAGE_RENDER_MARKER
-            ),
+            chosen.source.replace(QWEN.image_pad, request_frontend.IMAGE_RENDER_MARKER),
         }
         for path, render in (
             (
@@ -640,9 +639,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
             )
 
         for name in ("qwen36_gguf", "qwen38_gguf"):
-            app = frontend(
-                name, "<|im_start|>", "<|im_end|>", api_shapes.IMAGE_PAD_TOKEN
-            )
+            app = frontend(name, "<|im_start|>", "<|im_end|>", QWEN.image_pad)
             self.assertTrue(
                 app.chat_templates.describe().endswith("generation prompt 5-7 tokens")
             )

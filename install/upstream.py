@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import struct
 import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -299,7 +300,7 @@ def gguf_target(repo, names, scratch, *, projector=None):
     if projector is not None and family.vision:
         name, vision_header = projector(repo)
         try:
-            _validate_processor(gguf.processor_config(vision_header))
+            _validate_processor(gguf.processor_config(vision_header), family)
             config.write_bytes(
                 models.json_bytes(gguf.model_config(header, vision_header))
             )
@@ -343,7 +344,7 @@ def mlx_target(repo, language_only):
         # The text passed, so a refusal of the tower's processor, shards or
         # configuration refuses the vision alone.
         try:
-            _validate_processor(_image_processor(repo))
+            _validate_processor(_image_processor(repo), family)
             shards = _weight_files(repo, VISION_TOWER)
         except models.ModelError as error:
             raise models.VisionError(str(error)) from None
@@ -427,18 +428,37 @@ def _safetensors_tensors(repo, name):
     return set(header) - {"__metadata__"}
 
 
-def _validate_processor(config):
-    """Splash prepares images one way (server/images.py): 16-pixel patches in
-    two temporal slices, merged 2x2 and normalized to [-1, 1]. A processor
-    configuration asking for another is rejected before any download; it is
-    not installed, since nothing reads it."""
-    expected = {
+def _f32(values):
+    return [struct.unpack("<f", struct.pack("<f", value))[0] for value in values]
+
+
+# How Splash prepares a family's images (server/images.py, by its chat
+# format's image_resize), 16-pixel patches merged 2x2: Qwen's in two temporal
+# slices normalized to [-1, 1]; Nemotron Omni's in one, with CLIP's
+# normalization as its GGUF projector stores it, in float32.
+PROCESSORS = {
+    "qwen": {
         "patch_size": 16,
         "temporal_patch_size": 2,
         "merge_size": 2,
         "image_mean": [0.5, 0.5, 0.5],
         "image_std": [0.5, 0.5, 0.5],
-    }
+    },
+    "nemotron": {
+        "patch_size": 16,
+        "temporal_patch_size": 1,
+        "merge_size": 2,
+        "image_mean": _f32([0.48145466, 0.4578275, 0.40821073]),
+        "image_std": _f32([0.26862954, 0.26130258, 0.27577711]),
+    },
+}
+
+
+def _validate_processor(config, family):
+    """Splash prepares a family's images one way (PROCESSORS). A processor
+    configuration asking for another is rejected before any download; it is
+    not installed, since nothing reads it."""
+    expected = PROCESSORS[family.chat_format.image_resize]
     if any(config.get(key) != value for key, value in expected.items()):
         raise models.ModelError("unsupported vision preprocessing configuration")
 
