@@ -253,6 +253,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/GDN.cpp \
 	runtime/ops/Linear.cpp \
 	runtime/ops/LinearGguf.cpp \
+	runtime/ops/Mamba2.cpp \
 	runtime/ops/MoE.cpp \
 	runtime/ops/Normalization.cpp \
 	runtime/ops/HyperConnection.cpp \
