@@ -40,7 +40,12 @@
 //   default; gguf-moe-sigmoid builds Flint's, sigmoid weights over the sum of
 //   the top 6 and two ungated 512-wide slices of a 1024-wide shared expert,
 //   each slice's passes against the fp64 products of its rows and column
-//   window of the whole expert.
+//   window of the whole expert; gguf-moe-nemotron and gguf-moe-nemotron-e512
+//   Nemotron-H's latent MoE at 240 and 496 experts: the top 9 by sigmoid plus
+//   a selection bias (which moves the top 9 of a sizable share of rows, as
+//   the test requires), weighted by their sigmoids over their sum times 5,
+//   routed on rows twice the experts' width, ungated experts of ReLU^2 up
+//   projections, no shared expert and no residual.
 // Streamed experts (model::ExpertStore) run in expert_store_test.mm.
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
@@ -122,6 +127,12 @@ using namespace moe_fixture;
 #define GGUF_MOE_SHARED_SLICES 1
 #define GGUF_MOE_SHARED_GATE true
 #endif
+#ifndef GGUF_MOE_ACTIVATION
+#define GGUF_MOE_ACTIVATION SwiGlu
+#define GGUF_MOE_ROUTER_INPUT 0
+#define GGUF_MOE_ROUTED_SCALE 1.0f
+#define GGUF_MOE_RESIDUAL true
+#endif
 constexpr uint32_t kHidden = GGUF_MOE_HIDDEN;
 constexpr uint32_t kIntermediate = GGUF_MOE_INTERMEDIATE;
 constexpr uint32_t kExperts = GGUF_MOE_EXPERTS;
@@ -134,8 +145,16 @@ constexpr MoeShape kShape{.hiddenSize = kHidden,
                           .expertIntermediateSize = kIntermediate,
                           .router = splash::ops::MoeRouter::GGUF_MOE_ROUTER,
                           .sharedSlices = kSharedSlices,
-                          .sharedGate = GGUF_MOE_SHARED_GATE};
+                          .sharedGate = GGUF_MOE_SHARED_GATE,
+                          .activation = splash::ops::MoeActivation::GGUF_MOE_ACTIVATION,
+                          .routerInputSize = GGUF_MOE_ROUTER_INPUT,
+                          .routedScale = GGUF_MOE_ROUTED_SCALE};
 static_assert(kShape.valid(), "the test's routing is compiled");
+constexpr uint32_t kRouterInput = kShape.routerInput();
+constexpr bool kGated = kShape.activation == splash::ops::MoeActivation::SwiGlu;
+constexpr bool kBiased = kShape.router == splash::ops::MoeRouter::SigmoidBiased;
+// Without, the step's output is the routed sum alone (MoeBuffers::residual).
+constexpr bool kResidual = GGUF_MOE_RESIDUAL;
 
 [[noreturn]] void fail(const std::string &message) {
   std::cerr << "FAIL: " << message << '\n';
@@ -623,6 +642,8 @@ struct GateUp {
 
 struct Stats {
   size_t outputs = 0, gateUpFlips = 0, downFlips = 0;
+  // Rows whose top k the selection bias changed (kBiased), of `routedRows`.
+  size_t biasMoved = 0, routedRows = 0;
   // The worst |error| relative to the magnitudes its products sum (sum |x w|).
   double gateUpWorst = 0, downWorst = 0;
 };
@@ -677,6 +698,30 @@ std::vector<ComputeDispatch> fullGridsTwoPasses(const CommandGraph &graph, const
 
 // The byte every grouped route and grouped input holds before a run.
 constexpr uint8_t kCanary = 0xa5;
+
+// The step's buffers of b's rows: the input, the residual (with kResidual),
+// the router input (a router of its own width), and the output.
+void uploadRows(MetalBackend &backend, Buffers &b) {
+  b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
+  b.moe.residual = kResidual ? bfloatBuffer(backend, b.residual, "moe-residual") : MetalBuffer{};
+  b.moe.routerInput =
+      kShape.routerInputSize ? bfloatBuffer(backend, b.routerInput, "moe-router-input") : MetalBuffer{};
+  b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
+}
+// kMaximumRows rows of random input, residual and router input.
+Buffers randomRows(MetalBackend &backend) {
+  Buffers b;
+  b.input = activations(uint64_t{kMaximumRows} * kHidden);
+  b.residual = activations(uint64_t{kMaximumRows} * kHidden);
+  for (float &v : b.residual) v = bf16(0.1f * v);
+  if (kShape.routerInputSize) b.routerInput = activations(uint64_t{kMaximumRows} * kRouterInput);
+  uploadRows(backend, b);
+  return b;
+}
+// Row r of the rows the router reads.
+const float *routerRow(const Buffers &b, uint32_t r) {
+  return (kShape.routerInputSize ? b.routerInput : b.input).data() + uint64_t{r} * kRouterInput;
+}
 
 bool untouched(const void *data, uint64_t bytes) {
   const auto *begin = static_cast<const uint8_t *>(data);
@@ -828,7 +873,7 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
   // Each expert pass runs the live tiles of its column tiles; gate and up run
   // in one pass (_gate_up, _gate_up_mixed where their formats differ) or as
   // the gate and up passes (_a, then _g).
-  uint32_t gateUpPasses = 0, upPasses = 0;
+  uint32_t gateUpPasses = 0, upPasses = 0, reluPasses = 0;
   for (const ComputeDispatch &dispatch : graph.dispatches()) {
     const uint32_t *grid = nullptr;
     if (const MetalBuffer &buffer = dispatch.indirectThreadgroups.buffer)
@@ -840,43 +885,64 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
     const std::string_view pass = withoutSlices(dispatch.pipelineName);
     gateUpPasses += pass.ends_with("_gate_up") || pass.ends_with("_gate_up_mixed");
     upPasses += pass.ends_with("_g");
+    reluPasses += dispatch.pipelineName == "relu_squared";
   }
-  require(gateUpPasses == staged && upPasses == !staged,
-          label + (staged ? ": gate and up run in two passes" : ": gate and up run in one pass"));
+  if (kGated)
+    require(gateUpPasses == staged && upPasses == !staged && !reluPasses,
+            label + (staged ? ": gate and up run in two passes" : ": gate and up run in one pass"));
+  else
+    require(!gateUpPasses && !upPasses && reluPasses == 1, label + ": the ungated experts run a gate");
   for (uint32_t r = 0; r < rows; ++r) {
     const float *x = b.input.data() + uint64_t{r} * kHidden;
-    // Routes: the fp64 top-k by descending score, ascending id; the GPU's fp32
-    // scores may reorder only experts closer than their error bounds.
-    std::array<double, kExperts> score{}, bound{};
+    // Routes: the fp64 top-k by descending key, ascending id, the key the
+    // score or (kBiased) its sigmoid plus the expert's bias; the GPU's fp32
+    // keys may reorder only experts closer than their error bounds (a
+    // sigmoid's slope is at most 1/4).
+    const auto sigmoid = [](double value) { return 1.0 / (1.0 + std::exp(-value)); };
+    std::array<double, kExperts> score{}, bound{}, key{}, keyBound{};
     for (uint32_t e = 0; e < kExperts; ++e) {
-      const Dot d = dot(x, m.router.row(e), kHidden);
+      const Dot d = dot(routerRow(b, r), m.router.row(e), kRouterInput);
       score[e] = d.value;
-      bound[e] = floatBound(d, kHidden, plan.configuration().ggufRouterTile);
+      bound[e] = floatBound(d, kRouterInput, plan.configuration().ggufRouterTile);
+      key[e] = kBiased ? sigmoid(score[e]) + m.bias.values[e] : score[e];
+      keyBound[e] = kBiased ? bound[e] / 4 + std::ldexp(1.0, -22) : bound[e];
     }
-    std::array<uint32_t, kExperts> order;
-    std::iota(order.begin(), order.end(), 0u);
-    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t c) {
-      return score[a] != score[c] ? score[a] > score[c] : a < c;
-    });
+    const auto ranked = [](const std::array<double, kExperts> &by) {
+      std::array<uint32_t, kExperts> order;
+      std::iota(order.begin(), order.end(), 0u);
+      std::sort(order.begin(), order.end(),
+                [&](uint32_t a, uint32_t c) { return by[a] != by[c] ? by[a] > by[c] : a < c; });
+      return order;
+    };
+    const std::array<uint32_t, kExperts> order = ranked(key);
+    if (kBiased) {
+      const std::array<uint32_t, kExperts> unbiased = ranked(score);
+      stats.biasMoved += !std::is_permutation(order.begin(), order.begin() + kTopK, unbiased.begin());
+    }
+    ++stats.routedRows;
     for (uint32_t rank = 0; rank < kTopK; ++rank) {
       const uint32_t got = selected[r * kRoutes + rank], want = order[rank];
-      require(got == want || std::fabs(score[got] - score[want]) <= bound[got] + bound[want],
+      require(got == want || std::fabs(key[got] - key[want]) <= keyBound[got] + keyBound[want],
               label + ": row " + std::to_string(r) + " routes expert " + std::to_string(got) + " at rank " +
                   std::to_string(rank) + ", fp64 ranks " + std::to_string(want));
     }
     // fp32 weights: a softmax weight moves by at most twice the largest score
     // error of the routes (relative), a sigmoid by its argument's error, and
-    // a sigmoid over the sum of the top k's sigmoids by twice it.
-    const auto sigmoid = [](double value) { return 1.0 / (1.0 + std::exp(-value)); };
+    // a sigmoid over the sum of the top k's sigmoids by twice it (kBiased:
+    // the sum at least 2^-14, times the shape's scale). Experts of near keys
+    // a biased router may swap have far sigmoids, so its weights are those of
+    // the experts the GPU selected.
+    const auto expertAt = [&](uint32_t rank) { return kBiased ? selected[r * kRoutes + rank] : order[rank]; };
     const auto weight = [&](uint32_t rank) {
       return kShape.router == splash::ops::MoeRouter::Softmax ? std::exp(score[order[rank]] - score[order[0]])
-                                                              : sigmoid(score[order[rank]]);
+                                                              : sigmoid(score[expertAt(rank)]);
     };
     double denominator = 0, scoreError = 0;
     for (uint32_t rank = 0; rank < kTopK; ++rank) {
       denominator += weight(rank);
-      scoreError = std::max(scoreError, bound[order[rank]]);
+      scoreError = std::max(scoreError, bound[expertAt(rank)]);
     }
+    if (kBiased) denominator = std::max(denominator, std::ldexp(1.0, -14)) / kShape.routedScale;
     for (uint32_t rank = 0; rank < kTopK; ++rank) {
       const double want = weight(rank) / denominator;
       require(std::fabs(routing[r * kRoutes + rank] - want) <= want * (2 * scoreError + std::ldexp(1.0, -18)),
@@ -900,21 +966,43 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
     // shared slice's rows are its slice of the shared expert's (and of its
     // down projection, the rows of its column window).
     std::vector<double> expected(kHidden), magnitude(kHidden);
-    for (uint32_t c = 0; c < kHidden; ++c) expected[c] = b.residual[uint64_t{r} * kHidden + c];
+    if (kResidual)
+      for (uint32_t c = 0; c < kHidden; ++c) expected[c] = b.residual[uint64_t{r} * kHidden + c];
     for (uint32_t slot = 0; slot < kRoutes; ++slot) {
       const uint32_t route = r * kRoutes + slot, expert = selected[route], grouped = routeRows[route];
       const bool isShared = expert >= kExperts;
       // The expert's place among the routed experts or the shared slices.
       const uint64_t place = isShared ? expert - kExperts : expert;
       GateUp &gu = products[{r, expert}];
-      if (gu.gate.empty())
+      if (gu.up.empty())
         for (uint32_t n = 0; n < kIntermediate; ++n) {
           const uint64_t row = place * kIntermediate + n;
-          gu.gate.push_back(dot(x, (isShared ? m.shared[0] : m.routed[0]).row(row), kHidden));
+          if (kGated) gu.gate.push_back(dot(x, (isShared ? m.shared[0] : m.routed[0]).row(row), kHidden));
           gu.up.push_back(dot(x, (isShared ? m.shared[1] : m.routed[1]).row(row), kHidden));
         }
       std::vector<float> h(kIntermediate);
       for (uint32_t n = 0; n < kIntermediate; ++n) {
+        if (!kGated) {
+          // bf16(relu(bf16(u))^2), monotonic in u: inside the values of the
+          // up interval's ends.
+          const Dot &u = gu.up[n];
+          const double eu = projectionBound(u, staged);
+          const auto relu2 = [](double v) { return v > 0 ? v * v : 0.0; };
+          const double lo = relu2(bf16(u.value - eu)), hi = relu2(bf16(u.value + eu));
+          const double slack = std::ldexp(hi, -8) + 1e-7;
+          const float got = float(intermediate[uint64_t{grouped} * kIntermediate + n]);
+          h[n] = got;
+          const double exact = relu2(bf16(u.value));
+          if (!(got >= bf16(lo - slack) && got <= bf16(hi + slack)))
+            fail(label + ": up of row " + std::to_string(r) + " expert " + std::to_string(expert) + " column " +
+                 std::to_string(n) + ": " + std::to_string(got) + " outside [" + std::to_string(lo) + ", " +
+                 std::to_string(hi) + "]");
+          stats.gateUpFlips += got != bf16(exact);
+          // First order in the product's magnitude: |2 relu(u)| sum|x w_u|.
+          stats.gateUpWorst =
+              std::max(stats.gateUpWorst, std::fabs(got - exact) / (2 * std::fabs(u.value) * u.magnitude + 1e-30));
+          continue;
+        }
         const Dot &g = gu.gate[n], &u = gu.up[n];
         const double eg = projectionBound(g, staged), eu = projectionBound(u, staged);
         // bf16(u) * silu(bf16(g)) rounded to bf16: silu over the gate's
@@ -962,7 +1050,8 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
       }
     }
     for (uint32_t c = 0; c < kHidden; ++c) {
-      const double e = std::ldexp(magnitude[c] + std::fabs(b.residual[uint64_t{r} * kHidden + c]), -21);
+      const double e =
+          std::ldexp(magnitude[c] + (kResidual ? std::fabs(b.residual[uint64_t{r} * kHidden + c]) : 0.0), -21);
       const float got = float(output[uint64_t{r} * kHidden + c]);
       require(inside(got, expected[c], e), label + ": output of row " + std::to_string(r) + " column " +
                                                std::to_string(c) + " differs from the weighted expert sum");
@@ -997,7 +1086,8 @@ void bufferExtents(MetalBackend &backend) {
   const Model m = makeModel(backend, shape, 0, false);
   Buffers b;
   b.moe.input = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-input");
-  b.moe.residual = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-residual");
+  if (kResidual) b.moe.residual = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-residual");
+  b.moe.routerInput = zeros(backend, uint64_t{kMaximumRows} * kShape.routerInputSize * 2, "moe-router-input");
   b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
   for (const MoePlan &plan :
        {MoE::decodePlan(shape, 4, MoeConfig{.expertTile = MoeExpertTile::M8, .ggufTile = MoeGgufTile::Register}),
@@ -1023,6 +1113,7 @@ void bufferExtents(MetalBackend &backend) {
     for (const auto &[segment, kind] : {std::pair{&BlockExpertProjection::routed, "MoE expert "},
                                         std::pair{&BlockExpertProjection::shared, "MoE shared "}}) {
       const QuantizedSegment &tensor = blocks.*member.*segment;
+      if (!tensor.plane0) continue;   // a projection the block lacks
       const QuantFormat &format = kQuantFormats[tensor.formatId];
       const uint64_t groups = uint64_t{tensor.outputSize} * (tensor.inputSize / 32);
       for (const auto &[plane, planeName, unitBytes, units] :
@@ -1041,18 +1132,16 @@ void bufferExtents(MetalBackend &backend) {
                         [](BlockMoeWeights &changed, const MetalBuffer &view) {
                           changed.sharedScalarGate.plane0 = view;
                         });
+  if (kBiased)
+    requireWeightExtent(blocks.selectionBias, uint64_t{kExperts} * 4, 4, "MoE selection bias",
+                        [](BlockMoeWeights &changed, const MetalBuffer &view) { changed.selectionBias = view; });
 }
 
 int moe(MetalBackend &backend) {
   int failures = 0;
-  Buffers b;
-  b.input = activations(uint64_t{kMaximumRows} * kHidden);
-  b.residual = activations(uint64_t{kMaximumRows} * kHidden);
-  for (float &v : b.residual) v = bf16(0.1f * v);
-  b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
-  b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
-  b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
+  Buffers b = randomRows(backend);
   const MoeShape shape = kShape;
+  size_t biasMoved = 0, routedRows = 0;
   // A model's prefill on the staged 32-row tiles, whose live-row matmuls
   // (moe_live_rows) differ by chunk, with the router on each float tile: a
   // row's result is the same in every chunk on one tile (either tile's scores
@@ -1096,7 +1185,7 @@ int moe(MetalBackend &backend) {
   for (const MoeGgufTile tile : {MoeGgufTile::Staged, MoeGgufTile::Register})
     for (const Fmt f : tileFormats(tile))
       for (const bool upInGateFormats : {false, true}) {
-        if (upInGateFormats && tile == MoeGgufTile::Register) continue;   // two passes whatever the formats
+        if (upInGateFormats && (tile == MoeGgufTile::Register || !kGated)) continue;   // no one gate/up pass
         const Model m = makeModel(backend, shape, f, upInGateFormats, tile);
         std::map<std::pair<uint32_t, uint32_t>, GateUp> products;
         const std::string formats = formatNames(m);
@@ -1151,8 +1240,17 @@ int moe(MetalBackend &backend) {
                formats.c_str(), tile == MoeGgufTile::Register ? "register" : "staged  ",
                100.0 * stats.gateUpFlips / (stats.outputs / 2), 100.0 * stats.downFlips / stats.outputs,
                stats.gateUpWorst, stats.downWorst, compared, acrossKinds, failures > before ? "FAIL" : "ok");
+        biasMoved += stats.biasMoved;
+        routedRows += stats.routedRows;
         if (tile == MoeGgufTile::Staged) prefill32(m, products, formats);
       }
+  // A kernel that selected without the bias would pass the rows it leaves
+  // alone.
+  if (kBiased) {
+    printf("selection bias: changes the top %u of %zu of %zu routed rows %s\n", kTopK, biasMoved, routedRows,
+           biasMoved * 4 >= routedRows ? "ok" : "FAIL");
+    failures += biasMoved * 4 < routedRows;
+  }
   return failures;
 }
 
@@ -1169,14 +1267,14 @@ int moe(MetalBackend &backend) {
 int routingLoads(MetalBackend &backend) {
   enum class Load { Concentrated, Skewed };
   const MoeShape shape = kShape;
-  Model m = makeModel(backend, shape, Q4K, true);
-  m.router.values.assign(uint64_t{kExperts} * kHidden, 0.0f);
-  static_assert(kExperts <= 2 * kHidden, "the routing fixture holds two experts per input column");
-  const auto column = [](uint32_t expert) { return expert % kHidden; };
-  const auto sign = [](uint32_t expert) { return expert < kHidden ? 1.0f : -1.0f; };
+  Model m = makeModel(backend, shape, Q4K, kGated);
+  m.router.values.assign(uint64_t{kExperts} * kRouterInput, 0.0f);
+  static_assert(kExperts <= 2 * kRouterInput, "the routing fixture holds two experts per input column");
+  const auto column = [](uint32_t expert) { return expert % kRouterInput; };
+  const auto sign = [](uint32_t expert) { return expert < kRouterInput ? 1.0f : -1.0f; };
   for (uint32_t e = 0; e < kExperts; ++e)
-    m.router.values[uint64_t{e} * kHidden + column(e)] = 4.0f * sign(e);
-  m.router.segment = floatSegment(backend, m.router.values, kExperts, kHidden);
+    m.router.values[uint64_t{e} * kRouterInput + column(e)] = 4.0f * sign(e);
+  m.router.segment = floatSegment(backend, m.router.values, kExperts, kRouterInput);
   m.weights.router = m.router.segment;
   const std::string formats = formatNames(m);
   int failures = 0;
@@ -1186,17 +1284,17 @@ int routingLoads(MetalBackend &backend) {
     b.input = activations(uint64_t{kMaximumRows} * kHidden);
     b.residual = activations(uint64_t{kMaximumRows} * kHidden);
     for (float &v : b.residual) v = bf16(0.1f * v);
+    if (kShape.routerInputSize) b.routerInput = activations(uint64_t{kMaximumRows} * kRouterInput);
+    std::vector<float> &routing = kShape.routerInputSize ? b.routerInput : b.input;
     for (uint32_t r = 0; r < kMaximumRows; ++r) {
       const uint32_t first = load == Load::Concentrated || r % 8 < 6 ? 0 : r % kExperts;
       const uint32_t next = (first + 1) % kExperts;
-      for (uint32_t c = 0; c < std::min(kExperts, kHidden); ++c)
-        b.input[uint64_t{r} * kHidden + c] = bf16(0.01 * c * std::min(1.0, 16.0 / kExperts));
-      b.input[uint64_t{r} * kHidden + column(first)] = sign(first);
-      b.input[uint64_t{r} * kHidden + column(next)] = bf16(0.5f * sign(next));
+      for (uint32_t c = 0; c < std::min(kExperts, kRouterInput); ++c)
+        routing[uint64_t{r} * kRouterInput + c] = bf16(0.01 * c * std::min(1.0, 16.0 / kExperts));
+      routing[uint64_t{r} * kRouterInput + column(first)] = sign(first);
+      routing[uint64_t{r} * kRouterInput + column(next)] = bf16(0.5f * sign(next));
     }
-    b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
-    b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
-    b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
+    uploadRows(backend, b);
     std::map<std::pair<uint32_t, uint32_t>, GateUp> products;
     Stats stats;
     MoeRun widest, previous;
@@ -1243,13 +1341,7 @@ int routingLoads(MetalBackend &backend) {
 int nativeRouter(MetalBackend &backend) {
   const MoeShape shape = kShape;
   Model m = makeModel(backend, shape, Q4K, true);
-  Buffers b;
-  b.input = activations(uint64_t{kMaximumRows} * kHidden);
-  b.residual = activations(uint64_t{kMaximumRows} * kHidden);
-  for (float &v : b.residual) v = bf16(0.1f * v);
-  b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
-  b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
-  b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
+  Buffers b = randomRows(backend);
   // A plan's routes, routing weights and output rows.
   const auto run = [&](const MoePlan &plan, const QuantizedSegment &router) {
     allocate(backend, b, plan);
@@ -1266,10 +1358,10 @@ int nativeRouter(MetalBackend &backend) {
   };
   int failures = 0;
   for (const Fmt f : {Fmt(GGUF_FMT_AF8G64), Q80}) {
-    const std::vector<uint8_t> native = makeNative(f, kExperts, kHidden, rng);
-    const QuantizedSegment rows =
-        QuantizedSegment::rows(f, kExperts, kHidden, upload(backend, native.data(), native.size(), "router-rows"));
-    const QuantizedSegment values = gatheredValues(backend, f, kExperts, kHidden, rows.plane0);
+    const std::vector<uint8_t> native = makeNative(f, kExperts, kRouterInput, rng);
+    const QuantizedSegment rows = QuantizedSegment::rows(
+        f, kExperts, kRouterInput, upload(backend, native.data(), native.size(), "router-rows"));
+    const QuantizedSegment values = gatheredValues(backend, f, kExperts, kRouterInput, rows.plane0);
     std::vector<std::pair<std::string, MoePlan>> plans;
     for (uint32_t lanes = 1; lanes <= 4; ++lanes)
       plans.emplace_back("decode B" + std::to_string(lanes), MoE::decodePlan(shape, lanes, MoeConfig{}));
@@ -1313,18 +1405,16 @@ int permutedSlots(MetalBackend &backend) {
     MetalBuffer table = backend.allocateBuffer(uint64_t{kExperts} * sizeof(uint32_t), BufferStorage::Shared,
                                                "permuted-slots");
     std::vector<float> router(m.router.values.size());
+    std::vector<float> bias(m.bias.values.size());
     for (uint32_t expert = 0; expert < kExperts; ++expert) {
       static_cast<uint32_t *>(table.contents())[expert] = sigma(expert);
-      std::copy_n(m.router.row(sigma(expert)), kHidden, router.begin() + uint64_t{expert} * kHidden);
+      std::copy_n(m.router.row(sigma(expert)), kRouterInput, router.begin() + uint64_t{expert} * kRouterInput);
+      if (kBiased) bias[expert] = m.bias.values[sigma(expert)];
     }
     permuted.weights.slotTable = table;
-    permuted.weights.router = floatSegment(backend, router, kExperts, kHidden);
-    Buffers b;
-    b.input = activations(uint64_t{kMaximumRows} * kHidden);
-    b.residual = activations(uint64_t{kMaximumRows} * kHidden);
-    b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
-    b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
-    b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
+    permuted.weights.router = floatSegment(backend, router, kExperts, kRouterInput);
+    if (kBiased) permuted.weights.selectionBias = floatSegment(backend, bias, 1, kExperts).plane0;
+    Buffers b = randomRows(backend);
     const auto run = [&](const Model &model, const MoePlan &plan) {
       allocate(backend, b, plan);
       std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
@@ -1373,12 +1463,7 @@ int verifiedRows(MetalBackend &backend) {
     const Model m = makeModel(backend, shape, tileFormats(tile).front(), false, tile);
     const MoePlan plan = MoE::decodePlan(shape, 4, MoeConfig{.expertTile = MoeExpertTile::M8, .ggufTile = tile});
     const uint32_t rows = plan.rows(), tileRows = plan.tileRows();
-    Buffers b;
-    b.input = activations(uint64_t{kMaximumRows} * kHidden);
-    b.residual = activations(uint64_t{kMaximumRows} * kHidden);
-    b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
-    b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
-    b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
+    Buffers b = randomRows(backend);
     MetalBuffer verify = backend.allocateBuffer(kVerify.size() * sizeof(uint32_t), BufferStorage::Shared,
                                                 "verify-rows");
     std::copy(kVerify.begin(), kVerify.end(), static_cast<uint32_t *>(verify.contents()));

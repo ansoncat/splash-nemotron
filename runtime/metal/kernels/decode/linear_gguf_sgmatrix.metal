@@ -467,4 +467,5 @@ GGUF_SG_EXPERT(moe_expert_gguf_sg_a, EpNone, 1)
 GGUF_SG_EXPERT(moe_expert_gguf_sg_g, EpUpWithGate, 1)
 GGUF_SG_EXPERT(moe_expert_gguf_sg_a_s2, EpNone, 2)
 GGUF_SG_EXPERT(moe_expert_gguf_sg_g_s2, EpUpWithGate, 2)
+GGUF_SG_EXPERT(moe_expert_gguf_sg_a_s0, EpNone, 0)
 #undef GGUF_SG_EXPERT

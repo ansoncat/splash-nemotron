@@ -26,6 +26,18 @@ struct MoeRouteParams {
 static_assert(sizeof(MoeRouteParams) == 16,
               "MoE routing parameters are 16 bytes on both sides");
 
+// A biased sigmoid router's (ops::MoeRouter::SigmoidBiased): its routing
+// weights are scaled by `scale`.
+struct MoeBiasedRouteParams {
+  uint32_t rows;
+  uint32_t experts;
+  uint32_t top_k;
+  float scale;
+};
+
+static_assert(sizeof(MoeBiasedRouteParams) == 16,
+              "MoE biased routing parameters are 16 bytes on both sides");
+
 // Every row carries top_k routed experts followed by the slices of the shared
 // expert, ids `experts` on, whose routing weight is the sigmoid of the
 // block's scalar gate or 1 (ops::MoeShape). Routes are sorted by expert: tile

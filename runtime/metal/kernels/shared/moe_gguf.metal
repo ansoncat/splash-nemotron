@@ -81,6 +81,9 @@ template [[host_name("moe_expert_gguf_m8_a_s2")]] kernel MoeExpertGgufKernel moe
 template [[host_name("moe_expert_gguf_m8_g_s2")]] kernel MoeExpertGgufKernel moe_expert_gguf<8, EpUpWithGate, 2>;
 template [[host_name("moe_expert_gguf_m32_a_s2")]] kernel MoeExpertGgufKernel moe_expert_gguf<32, EpNone, 2>;
 template [[host_name("moe_expert_gguf_m32_g_s2")]] kernel MoeExpertGgufKernel moe_expert_gguf<32, EpUpWithGate, 2>;
+// Without a shared expert, the ungated (ReLU^2) experts' up and down passes.
+template [[host_name("moe_expert_gguf_m8_a_s0")]] kernel MoeExpertGgufKernel moe_expert_gguf<8, EpNone, 0>;
+template [[host_name("moe_expert_gguf_m32_a_s0")]] kernel MoeExpertGgufKernel moe_expert_gguf<32, EpNone, 0>;
 
 // The gate and up passes in one (ops/MoE.cpp): threadgroup (x, y) runs a gate simdgroup and an up simdgroup on the same
 // 32 columns of tile y, grid (N / 32, tiles), each through its own stage in its own pass's formats, as in

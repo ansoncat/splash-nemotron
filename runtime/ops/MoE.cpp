@@ -28,7 +28,9 @@ void requireSegment(const QuantizedSegment &segment, uint32_t output, uint32_t i
 // addGgufFloat, which checks its weights.
 void validate(const BlockMoeWeights &weights, MoeShape shape) {
   const uint32_t hidden = shape.hiddenSize, intermediate = shape.expertIntermediateSize;
-  requireSegment(weights.router, shape.experts, hidden, true, "MoE router");
+  requireSegment(weights.router, shape.experts, shape.routerInput(), true, "MoE router");
+  if (shape.router == MoeRouter::SigmoidBiased)
+    requireBytes(weights.selectionBias, uint64_t{shape.experts} * sizeof(float), "MoE selection bias");
   if (shape.sharedGate) {
     requireSegment(weights.sharedScalarGate, 1, hidden, true, "MoE shared scalar gate");
     // The select kernel reads the scalar gate's fp32 weights.
@@ -41,8 +43,10 @@ void validate(const BlockMoeWeights &weights, MoeShape shape) {
   for (const auto &[projection, name, output, input] :
        {std::tuple{&weights.gate, "gate", intermediate, hidden}, std::tuple{&weights.up, "up", intermediate, hidden},
         std::tuple{&weights.down, "down", hidden, intermediate}}) {
+    if (projection == &weights.gate && shape.activation == MoeActivation::ReluSquared) continue;
     requireSegment(projection->routed, weights.slots * output, input, false, std::string("MoE expert ") + name);
-    requireSegment(projection->shared, shape.sharedSlices * output, input, false, std::string("MoE shared ") + name);
+    if (shape.sharedSlices)
+      requireSegment(projection->shared, shape.sharedSlices * output, input, false, std::string("MoE shared ") + name);
   }
 }
 
@@ -85,15 +89,25 @@ std::string routingKernel(std::string name, MoeShape shape, std::string_view Com
 
 // Whether a plan runs gate and up in one pass
 // (moe_expert_gguf_m<rows>_gate_up[_mixed]): on the staged tile, whose simdgroups
-// each decode their own pass's formats. The register tile runs two passes.
-bool oneGateUpPass(const MoePlan &plan) noexcept { return plan.configuration().ggufTile == MoeGgufTile::Staged; }
+// each decode their own pass's formats. The register tile runs two passes, and
+// ReluSquared experts an up pass alone.
+bool oneGateUpPass(const MoePlan &plan) noexcept {
+  return plan.configuration().ggufTile == MoeGgufTile::Staged && plan.shape().activation == MoeActivation::SwiGlu;
+}
+
+// The segment a pass binds in its shared slots: without shared slices, which
+// the passes never read, the routed one.
+const QuantizedSegment &sharedSlots(const BlockExpertProjection &projection, MoeShape shape) noexcept {
+  return shape.sharedSlices ? projection.shared : projection.routed;
+}
 
 // The expert passes over grouped tiles, each on the grid of the live
 // tiles that the grouping wrote (MoeTileCount), within the column tiles of
 // `group` and maximumTiles(): gate and up in one pass into
 // expertIntermediate (oneGateUpPass), or gate into expertOutput (the down
 // pass overwrites it after the up pass consumed it) and up with silu(gate)
-// into expertIntermediate; then down into expertOutput. The gate/up passes
+// into expertIntermediate, or ReluSquared's up into expertIntermediate and
+// ReLU^2 there (over every tile); then down into expertOutput. The gate/up passes
 // read the grouped rows the gather writes into groupedInput, as Table16 tiles
 // on register plans, whose down pass reads the tiles a prepare dispatch
 // writes there.
@@ -102,9 +116,11 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
   const MoeShape shape = plan.shape();
   const uint32_t tiles = plan.maximumTiles();
   const bool table16 = plan.configuration().ggufTile == MoeGgufTile::Register;
+  const bool gated = shape.activation == MoeActivation::SwiGlu;
   if (table16)
     for (const BlockExpertProjection *projection : {&weights.gate, &weights.up, &weights.down})
-      for (const QuantizedSegment *s : {&projection->routed, &projection->shared})
+      for (const QuantizedSegment *s : {&projection->routed, &sharedSlots(*projection, shape)})
+        if (gated || projection != &weights.gate)
         if (!quant_register_tensor(s->formatId, s->inputSize))
           throw std::invalid_argument(std::string("the register expert tile does not take ") + s->name() +
                                       " weights of " + std::to_string(s->inputSize) + " inputs");
@@ -115,7 +131,8 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
   const metal::IndirectGrid gateUpGrid{scratch.tileCount, offsetof(MoeTileCount, gate_up_grid)};
   const metal::IndirectGrid downGrid{scratch.tileCount, offsetof(MoeTileCount, down_grid)};
   const auto params = [&](const BlockExpertProjection &projection, uint32_t n, uint32_t k) {
-    return MoeGgufExpertParams{k, n, shape.experts, projection.routed.formatId, projection.shared.formatId};
+    return MoeGgufExpertParams{k, n, shape.experts, projection.routed.formatId,
+                               sharedSlots(projection, shape).formatId};
   };
   const auto pass = [&](const BlockExpertProjection &projection, bool up,
                         const metal::MetalBuffer &passInput,
@@ -123,18 +140,23 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
                         uint32_t columns, const metal::IndirectGrid &grid) {
     std::vector<metal::MetalBuffer> bindings{passInput};
     if (table16) bindings.push_back(scratch.groupedSums);
+    const QuantizedSegment &shared = sharedSlots(projection, shape);
     bindings.insert(bindings.end(),
                     {scratch.tileDescriptors, scratch.tileCount,
                      projection.routed.plane0, projection.routed.plane1Slot(),
-                     projection.routed.meta, projection.shared.plane0,
-                     projection.shared.plane1Slot(), projection.shared.meta, output,
+                     projection.routed.meta, shared.plane0,
+                     shared.plane1Slot(), shared.meta, output,
                      scratch.expertOutput, weights.slotTable});
     graph.add(kernel + (up ? "_g" : "_a") + slices, std::move(bindings), params(projection, n, k), {columns, tiles, 1},
               grid, {threads, 1, 1});
   };
   const uint32_t hidden = shape.hiddenSize;
   const uint32_t intermediate = shape.expertIntermediateSize;
-  if (oneGateUpPass(plan)) {
+  if (!gated) {
+    pass(weights.up, false, scratch.groupedInput, scratch.expertIntermediate,
+         intermediate, hidden, group.gate_up_columns, gateUpGrid);
+    MoE::addReluSquared(graph, scratch.expertIntermediate, uint64_t{tiles} * plan.tileRows() * intermediate);
+  } else if (oneGateUpPass(plan)) {
     const BlockExpertProjection &gate = weights.gate, &up = weights.up;
     // One pair table where gate and up share their formats, one each otherwise.
     const bool mixed = gate.routed.formatId != up.routed.formatId || gate.shared.formatId != up.shared.formatId;
@@ -212,13 +234,18 @@ void MoE::addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
   const MoeWorkspace &required = plan.workspace();
   const uint64_t hiddenRows = uint64_t{rows} * shape.hiddenSize * sizeof(uint16_t);
   requireBytes(buffers.input, hiddenRows, "MoE input");
-  requireBytes(buffers.residual, hiddenRows, "MoE residual");
+  if (buffers.residual) requireBytes(buffers.residual, hiddenRows, "MoE residual");
   requireBytes(buffers.output, hiddenRows, "MoE output");
+  if (shape.routerInputSize && !buffers.routerInput)
+    throw std::invalid_argument("the MoE router reads rows of its own width, which the step lacks");
+  const metal::MetalBuffer &routerInput = buffers.routerInput ? buffers.routerInput : buffers.input;
+  requireBytes(routerInput, uint64_t{rows} * shape.routerInput() * sizeof(uint16_t), "MoE router input");
   const MoeScratch &scratch = buffers.scratch;
   for (const MoeScratchField &field : kMoeScratchFields)
     requireBytes(scratch.*field.buffer, required.*field.bytes, field.name);
-  addRoutes(graph, buffers.input, weights.router, weights.sharedScalarGate, scratch.groupedInput,
-            scratch.selectedExperts, scratch.routingWeights, rows, shape, plan.configuration().ggufRouterTile);
+  addRoutes(graph, routerInput, weights.router, weights.sharedScalarGate, scratch.groupedInput,
+            scratch.selectedExperts, scratch.routingWeights, rows, shape, plan.configuration().ggufRouterTile,
+            weights.selectionBias);
   // The expert passes launch the live tiles alone, on grids the grouping
   // writes with the tile count. Over every tile a step could fill, a 35B
   // decode step of one lane launched 65 tiles' threadgroups for a median of
@@ -258,29 +285,47 @@ void MoE::addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
                scratch.tileCount, scratch.groupedInput},
               gather, {tiles, shape.hiddenSize / 256, 1});
   addExperts(graph, scratch, weights, plan, groupParams(plan));
-  graph.add("moe_combine",
-            {scratch.expertOutput, scratch.routeRows, scratch.routingWeights,
-             buffers.residual, buffers.output},
-            MoeCombineParams{rows, shape.hiddenSize, shape.routesPerToken()},
-            {rows, shape.hiddenSize / 256, 1});
+  const MoeCombineParams combine{rows, shape.hiddenSize, shape.routesPerToken()};
+  if (buffers.residual)
+    graph.add("moe_combine",
+              {scratch.expertOutput, scratch.routeRows, scratch.routingWeights,
+               buffers.residual, buffers.output},
+              combine, {rows, shape.hiddenSize / 256, 1});
+  else
+    graph.add("moe_combine_routed", {scratch.expertOutput, scratch.routeRows, scratch.routingWeights, buffers.output},
+              combine, {rows, shape.hiddenSize / 256, 1});
 }
 
 void MoE::addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input, const QuantizedSegment &router,
                     const QuantizedSegment &sharedScalarGate, const metal::MetalBuffer &scores,
                     const metal::MetalBuffer &selected, const metal::MetalBuffer &routingWeights, uint32_t rows,
-                    MoeShape shape, FloatTile routerTile) {
+                    MoeShape shape, FloatTile routerTile, const metal::MetalBuffer &selectionBias) {
   // The router's fp32 scores, in the format its checkpoint holds it
   // (BlockMoeWeights), in rows of routerWidth() expert slots, as the select
   // kernel of that width reads, which weights gated shared slices by the
   // sigmoid of the input's product with the scalar gate.
   const uint32_t width = shape.routerWidth();
   addGgufFloat(graph, input, router, scores, rows, width, 0, FloatOutput::Float32, routerTile);
+  if (shape.router == MoeRouter::SigmoidBiased) {
+    requireBytes(selectionBias, uint64_t{shape.experts} * sizeof(float), "MoE selection bias");
+    graph.add(routingKernel("moe_route_select_f32", shape, &CompiledMoeRouting::selectSuffix),
+              {scores, selectionBias, selected, routingWeights},
+              MoeBiasedRouteParams{rows, shape.experts, shape.expertsPerToken, shape.routedScale}, {rows, 1, 1},
+              {width, 1, 1});
+    return;
+  }
   std::vector<metal::MetalBuffer> bindings{scores};
   if (shape.sharedGate) bindings.insert(bindings.end(), {input, sharedScalarGate.plane0});
   bindings.insert(bindings.end(), {selected, routingWeights});
   graph.add(routingKernel("moe_route_select_f32", shape, &CompiledMoeRouting::selectSuffix), std::move(bindings),
             MoeRouteParams{rows, shape.hiddenSize, shape.experts, shape.expertsPerToken}, {rows, 1, 1},
             {width, 1, 1});
+}
+
+void MoE::addReluSquared(metal::CommandGraph &graph, const metal::MetalBuffer &values, uint64_t elements) {
+  if (elements % 256) throw std::invalid_argument("ReLU^2 runs whole 256-value groups");
+  requireBytes(values, elements * sizeof(uint16_t), "ReLU^2 values");
+  graph.add("relu_squared", {values}, {elements / 256, 1, 1}, {256, 1, 1});
 }
 
 uint32_t MoE::expertLoadGroups(const MoeExpertLoadParams &params) noexcept {

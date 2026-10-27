@@ -103,13 +103,14 @@ inline splash::metal::MetalBuffer bfloatBuffer(splash::metal::MetalBackend &back
 }
 
 // A block of `shape`: its router, shared expert scalar gate (none without
-// shape.sharedGate), routed experts' and shared expert's gate, up and down,
-// the shared expert's shape.sharedSlices slices in the order the kernels read
-// them (ops::BlockExpertProjection), their weights with expert e in slot e,
-// and the formats of the six projections.
+// shape.sharedGate), selection bias (a SigmoidBiased router's), routed
+// experts' and shared expert's gate (none for ReluSquared experts), up and
+// down, the shared expert's shape.sharedSlices slices in the order the
+// kernels read them (ops::BlockExpertProjection), their weights with expert e
+// in slot e, and the formats of the six projections.
 struct Model {
   splash::ops::MoeShape shape;
-  Tensor router, sharedGate;
+  Tensor router, sharedGate, bias;
   std::array<Tensor, 3> routed;   // gate, up, down: experts * N rows
   std::array<Tensor, 3> shared;   // sharedSlices * N rows
   splash::ops::BlockMoeWeights weights;
@@ -161,15 +162,18 @@ inline Model makeModel(splash::metal::MetalBackend &backend, const splash::ops::
     m.formats[1] = m.formats[0];
     m.formats[4] = m.formats[3];
   }
-  m.router = floating(backend, shape.experts, hidden, 0.05f);
+  m.router = floating(backend, shape.experts, shape.routerInput(), 0.05f);
   if (shape.sharedGate) m.sharedGate = floating(backend, 1, hidden, 0.05f);
+  if (shape.router == splash::ops::MoeRouter::SigmoidBiased) m.bias = floating(backend, 1, shape.experts, 0.01f);
   for (int p = 0; p < 3; ++p) {
+    if (p == 0 && shape.activation == splash::ops::MoeActivation::ReluSquared) continue;
     m.routed[p] = quantized(backend, m.formats[p], shape.experts * n[p], k[p]);
-    m.shared[p] = quantized(backend, m.formats[3 + p], shape.sharedSlices * n[p], k[p]);
+    if (shape.sharedSlices) m.shared[p] = quantized(backend, m.formats[3 + p], shape.sharedSlices * n[p], k[p]);
   }
   splash::ops::BlockMoeWeights gguf;
   gguf.router = m.router.segment;
   gguf.sharedScalarGate = m.sharedGate.segment;
+  gguf.selectionBias = m.bias.segment.plane0;
   gguf.gate = {m.routed[0].segment, m.shared[0].segment};
   gguf.up = {m.routed[1].segment, m.shared[1].segment};
   gguf.down = {m.routed[2].segment, m.shared[2].segment};
@@ -179,18 +183,22 @@ inline Model makeModel(splash::metal::MetalBackend &backend, const splash::ops::
   return m;
 }
 
-// The model's six formats, "gate/up/down/shared gate/shared up/shared down".
+// The model's six formats, "gate/up/down/shared gate/shared up/shared down",
+// "-" for a projection it lacks.
 inline std::string formatNames(const Model &m) {
   std::string names;
-  for (const gguf_reference::Fmt format : m.formats)
-    names += std::string(names.empty() ? "" : "/") + gguf_reference::fmtName(format);
+  for (size_t i = 0; i < m.formats.size(); ++i) {
+    const Tensor &tensor = i < 3 ? m.routed[i] : m.shared[i - 3];
+    names += std::string(i ? "/" : "") + (tensor.rows ? gguf_reference::fmtName(m.formats[i]) : "-");
+  }
   return names;
 }
 
-// A step's buffers, and the fp32 values of its input and residual rows.
+// A step's buffers, and the fp32 values of its input, residual and router
+// input rows (MoeShape::routerInputSize; none without).
 struct Buffers {
   splash::ops::MoeBuffers moe;
-  std::vector<float> input, residual;
+  std::vector<float> input, residual, routerInput;
 };
 
 // The scratch `plan` runs in, zeroed.
