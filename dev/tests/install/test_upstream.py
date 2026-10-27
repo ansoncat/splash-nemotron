@@ -74,6 +74,9 @@ class UpstreamTest(unittest.TestCase):
         for family in families.FAMILIES:
             if family in GGUF_ONLY:
                 continue
+            # Nemotron-H has no installer fixtures yet.
+            if family.name == "Nemotron-3.5-Bolt":
+                continue
             config = mlx_target(self.root / family.name, family) / "config.json"
             draft = draft_dir(self.root / family.name / "draft", family)
             for arguments in ({}, {"draft": draft / "config.json"}):

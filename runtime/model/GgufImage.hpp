@@ -93,6 +93,9 @@ struct TensorRows {
   SafetensorsSource safetensors{};
   TensorScale scale{};
   uint64_t ggufNvfp4RowBytes = 0;
+  // Q8_0 rows whose block scales the writer multiplies by `scale` (a
+  // Nemotron-H Mamba-2 projection's .scale, model/NemotronH.hpp).
+  bool ggufScaledQ8_0 = false;
   uint32_t ggufFloatType = 0;
   uint64_t ggufFloatRowBytes = 0;
   uint64_t first = 0; // the source row of image row 0

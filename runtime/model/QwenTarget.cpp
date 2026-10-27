@@ -97,8 +97,12 @@ QwenTarget::QwenTarget(const QwenTargetWeightsBase &weights, const QwenTargetGeo
                        metal::MetalBackend &backend, const ops::ExecutionPlans &operators)
     : weightsBase_(weights), geometry_(geometry), backend_(backend), operators_(operators) {
   if (!geometry_.valid()) throw std::invalid_argument("Qwen target weights do not match execution geometry");
+  // A target whose every attention layer is unrotated (Nemotron-H's NoPE)
+  // runs a kernel that reads no RoPE.
+  const uint32_t attention = geometry_.attentionLayerCount();
+  const bool rotated = attention >= 64 || (~geometry_.unrotatedLayers & ((uint64_t{1} << attention) - 1));
   if (!ops::PagedAttention::compiles(geometry_.attentionQueryHeads, geometry_.kvLayout, geometry_.attentionGate,
-                                     geometry_.rotaryPairs))
+                                     rotated ? geometry_.rotaryPairs : 0))
     throw std::invalid_argument("no attention kernel for the target's output gate and RoPE");
 }
 

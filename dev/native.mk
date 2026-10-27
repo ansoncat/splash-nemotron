@@ -667,6 +667,8 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 # The vision fixture is named after the installed model's family, which its
 # model.json records. Nothing is printed when the installation serves no
 # vision (vision_format none: --language-only, or a GGUF without an mmproj).
+# The second oracle run keeps the state in bf16 where the family's state takes
+# it (install/families.py), and in fp32 otherwise.
 # ORACLE_ARGS: options every run of the runtime oracle takes besides its own,
 # as the oracle takes them (model_runtime_oracle_test.mm). A block-sparse
 # target's spill check runs in each: by default, with two staging buffers,
@@ -675,6 +677,10 @@ ORACLE_ARGS ?=
 VISION_FIXTURE_FAMILY := import json, pathlib, sys; \
 	model = json.loads((pathlib.Path(sys.argv[1]) / "model.json").read_text()); \
 	print("" if model["vision_format"] == "none" else model["family"].lower())
+ORACLE_STATE_FORMAT := import json, pathlib, sys; \
+	from install import families; \
+	model = json.loads((pathlib.Path(sys.argv[1]) / "model.json").read_text()); \
+	print("bf16" if "bf16" in families.named(model["family"]).state_formats else "fp32")
 test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 		$(TEST_VISION_ENCODER_TEST) $(LIB)
 	family=$$($(BUILD_ID_PYTHON) -c '$(VISION_FIXTURE_FAMILY)' "$(MODEL_ROOT)") && \
@@ -683,8 +689,9 @@ test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 				dev/tests/fixtures/vision-parity/$$family; \
 		else echo "vision parity: skipped, the installation serves text only"; fi
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 $(ORACLE_ARGS)
-	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 --state-format bf16 \
-		--spill-buffers 2 $(ORACLE_ARGS)
+	state=$$($(PYTHON) -c '$(ORACLE_STATE_FORMAT)' "$(MODEL_ROOT)") && \
+		$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 --state-format $$state \
+			--spill-buffers 2 $(ORACLE_ARGS)
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --spill-tokens 32768 --spill-window 64 $(ORACLE_ARGS)
 
 .PHONY: benchmark-backend \

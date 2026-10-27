@@ -10,13 +10,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from server.chat_format import FLINT, QWEN, ChatFormat
+from server.chat_format import FLINT, NEMOTRON, QWEN, ChatFormat
 
 
 @dataclass(frozen=True)
 class ModelFamily:
     # The family's name, as the engine names it (each target layout's family,
-    # runtime/model/Qwen3_8.hpp, Qwen3_6Moe.hpp, Qwen4Exp.hpp and Flint.hpp).
+    # runtime/model/Qwen3_8.hpp, Qwen3_6Moe.hpp, Qwen4Exp.hpp, Flint.hpp and NemotronH.hpp).
     name: str
     # The repository of the DFlash2 draft released for the family, as its
     # release publishes it (config.json and BF16 safetensors). Installations
@@ -31,6 +31,10 @@ class ModelFamily:
     # loads from the target repository unless --language-only. The models of
     # a family without one serve text only, whatever their repository holds.
     vision: bool = True
+    # The --state-format values the family's recurrent state is kept in
+    # (server/serve_options.py); the server refuses another before it starts
+    # the engine.
+    state_formats: tuple[str, ...] = ("fp32", "bf16")
 
 
 FAMILIES = (
@@ -42,6 +46,12 @@ FAMILIES = (
     ModelFamily("Qwen3.8-Flash-Next", "incoai/Qwen3.8-Flash-Next-DFlash2", QWEN),
     # It has no vision tower.
     ModelFamily("Flint", "incoai/Flint-DFlash2", FLINT, vision=False),
+    # No DFlash2 draft is released for it (LiLiCorr is converted); it serves
+    # text only. Its Mamba-2 state is fp32 only
+    # (runtime/model/NemotronHTarget.cpp).
+    ModelFamily(
+        "Nemotron-3.5-Bolt", None, NEMOTRON, vision=False, state_formats=("fp32",)
+    ),
 )
 
 

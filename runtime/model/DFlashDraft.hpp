@@ -90,7 +90,12 @@ struct DFlashDraftLayout final {
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> targetLayers{};
   uint32_t targetLayerCount = 0;
 
+  // A model without a draft (Nemotron-H) has the empty layout: its runtime
+  // verifies only each lane's anchor row, and nothing reads or writes the
+  // draft's state.
+  [[nodiscard]] constexpr bool present() const noexcept { return layers != 0; }
   [[nodiscard]] constexpr DraftStateLayout stateLayout() const noexcept {
+    if (!present()) return {};
     return {layers, kvHeads, attentionHeadDimension, hiddenSize};
   }
   [[nodiscard]] constexpr std::span<const uint32_t> targetLayerIds() const noexcept {

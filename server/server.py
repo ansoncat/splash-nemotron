@@ -1795,6 +1795,12 @@ def main():
                 f"{args.model} is not prepared as a model of a family this "
                 "release serves: prepare it again"
             )
+        if args.state_format not in family.state_formats:
+            raise ModelError(
+                f"{args.model} keeps its recurrent state in "
+                f"{' or '.join(family.state_formats)} only: serve it without "
+                f"--state-format {args.state_format}"
+            )
         tokenizer = AutoTokenizer.from_pretrained(
             model_root / "tokenizer", local_files_only=True, trust_remote_code=False
         )

@@ -170,12 +170,24 @@ FLINT_PATTERNS = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?"
     r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 )
+# Tekken (Mistral's, and Nemotron-H's): no normalizer, and BPE that takes a
+# word already in the vocabulary whole (ignore_merges), as the model's
+# tokenizer.json states. Its GGUFs name it pixtral or tekken (llama.cpp
+# #30894: Nemotron GGUFs converted before it say pixtral).
+TEKKEN_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
 # Each GGUF tokenizer profile (tokenizer.ggml.pre) Splash derives a tokenizer
 # for: the patterns that split text, each isolating its matches, in order,
-# and whether text is NFC-normalized before them.
+# whether text is NFC-normalized before them, and whether its BPE takes
+# vocabulary words whole (ignore_merges).
 TOKENIZER_PROFILES = {
-    "qwen35": ((QWEN35_PATTERN,), True),
-    "flint": (FLINT_PATTERNS, False),
+    "qwen35": ((QWEN35_PATTERN,), True, False),
+    "flint": (FLINT_PATTERNS, False, False),
+    "tekken": ((TEKKEN_PATTERN,), False, True),
+    "pixtral": ((TEKKEN_PATTERN,), False, True),
 }
 # The GGUF token types (llama_token_type) a byte-level BPE vocabulary uses:
 # control tokens are special added tokens, user-defined ones added tokens
@@ -219,7 +231,7 @@ def tokenizer_files(metadata):
             "unsupported GGUF tokenizer profile; expected gpt2/"
             + " or gpt2/".join(TOKENIZER_PROFILES)
         )
-    patterns, nfc = profile
+    patterns, nfc, ignore_merges = profile
     tokens = metadata.require("tokenizer.ggml.tokens", list)
     types = metadata.require("tokenizer.ggml.token_type", list)
     merges = metadata.require("tokenizer.ggml.merges", list)
@@ -247,7 +259,9 @@ def tokenizer_files(metadata):
             raise ModelError("GGUF automatic BOS/EOS insertion is unsupported: " + key)
     try:
         backend = Tokenizer(
-            token_models.BPE({t: i for i, t in enumerate(tokens)}, pairs)
+            token_models.BPE(
+                {t: i for i, t in enumerate(tokens)}, pairs, ignore_merges=ignore_merges
+            )
         )
     except Exception as error:
         raise ModelError("invalid GGUF BPE vocabulary or merges") from error
@@ -341,11 +355,18 @@ def model_config(metadata, vision=None):
         "num_key_value_heads": "attention.head_count_kv",
         "head_dim": "attention.key_length",
     }
+    if architecture.single_blocks:
+        # Per-layer arrays: the engine reads them from the GGUF; the config
+        # states each layer's block and the attention layers' KV heads.
+        del fields["num_key_value_heads"]
     if architecture.moe:
         # The routed experts, which a pruned release keeps fewer of than its
         # family; the engine plans, sizes and loads them by this count.
         fields["num_experts"] = "expert_count"
     text = {name: metadata.positive(arch + "." + key) for name, key in fields.items()}
+    if ARCHITECTURES[arch].single_blocks:
+        kv = [n for n in metadata.values[arch + ".attention.head_count_kv"] if n]
+        text.update(layer_types=nemotron_blocks(metadata), num_key_value_heads=max(kv))
     text.update(
         num_hidden_layers=loaded_layers(metadata, arch),
         model_type=architecture.model_type,
@@ -701,6 +722,49 @@ FLINT_MOE_TENSORS = {
 }
 
 
+# Nemotron-H (nemotron_h_moe, Nemotron 3.5 Bolt): every layer is one block,
+# Mamba-2, NoPE attention or a latent MoE, each behind its own norm; the
+# per-layer arrays tell them apart (nemotron_blocks). The MoE runs its routed
+# experts (up and down, ReLU squared, no gate) in a latent width between two
+# dense projections, routes by sigmoid with a selection bias, and has a shared
+# expert of its own width. Mamba-2's in and out projections may carry the
+# scalar .scale llama.cpp multiplies their products by (SCALED_TENSORS).
+NEMOTRON_LAYER_TENSORS = {"attn_norm.weight": NORM_TYPES}
+MAMBA2_TENSORS = {
+    "ssm_in.weight": FORMAT_TYPES,
+    "ssm_conv1d.weight": F32,
+    "ssm_conv1d.bias": F32,
+    "ssm_dt.bias": F32,
+    "ssm_a": F32,
+    "ssm_d": F32,
+    "ssm_norm.weight": NORM_TYPES,
+    "ssm_out.weight": FORMAT_TYPES,
+}
+NOPE_ATTENTION_TENSORS = {
+    "attn_q.weight": FORMAT_TYPES,
+    "attn_k.weight": FORMAT_TYPES,
+    "attn_v.weight": FORMAT_TYPES,
+    "attn_output.weight": FORMAT_TYPES,
+}
+LATENT_MOE_TENSORS = {
+    "ffn_gate_inp.weight": FLOAT_PROJECTION_TYPES,
+    "exp_probs_b.bias": F32,
+    "ffn_latent_down.weight": FORMAT_TYPES,
+    "ffn_latent_up.weight": FORMAT_TYPES,
+    "ffn_up_exps.weight": FORMAT_TYPES,
+    "ffn_down_exps.weight": FORMAT_TYPES,
+    "ffn_up_shexp.weight": FORMAT_TYPES,
+    "ffn_down_shexp.weight": FORMAT_TYPES,
+}
+NEMOTRON_BLOCK_TENSORS = {
+    "mamba": MAMBA2_TENSORS,
+    "attention": NOPE_ATTENTION_TENSORS,
+    "moe": LATENT_MOE_TENSORS,
+}
+# The projections whose .scale the loader keeps as a scalar beside any format.
+SCALED_TENSORS = {"ssm_in.weight", "ssm_out.weight"}
+
+
 @dataclass(frozen=True)
 class Architecture:
     """A GGUF text architecture Splash serves, as the native loader reads it
@@ -721,6 +785,9 @@ class Architecture:
     # The one layer its PLE n-gram embedding feeds, which ple.layers names
     # alone; it reads QWEN4_PLE_TENSORS. None without one.
     ple_layer: int | None = None
+    # Whether each layer is a single block of NEMOTRON_BLOCK_TENSORS
+    # (nemotron_blocks) rather than a mixer and an FFN.
+    single_blocks: bool = False
     # A MoE layer's tensors beside the layer's own.
     moe_tensors: dict = field(default_factory=lambda: MOE_TENSORS)
     # Whether its layers are Qwen3.5's hybrid of GDN and full attention, each
@@ -755,6 +822,13 @@ ARCHITECTURES = {
         qsa_block=4,
         ple_layer=1,
     ),
+    "nemotron_h_moe": Architecture(
+        "nemotron_h_moe_text",
+        MODEL_TENSORS,
+        NEMOTRON_LAYER_TENSORS,
+        moe=True,
+        single_blocks=True,
+    ),
     "flint": Architecture(
         "flint",
         MODEL_TENSORS,
@@ -770,6 +844,36 @@ ARCHITECTURES = {
 }
 
 
+def nemotron_blocks(metadata):
+    """Each layer's block of a single-block target, as llama.cpp tells them
+    apart (src/models/nemotron-h.cpp): a MoE where feed_forward_length is
+    nonzero, attention where head_count_kv is instead, else Mamba-2. The
+    arrays must cover every layer, and the expert count each MoE takes must
+    be nonzero exactly there."""
+    arch = text_architecture(metadata)
+    layers = loaded_layers(metadata, arch)
+    arrays = {}
+    for key in ("feed_forward_length", "attention.head_count_kv", "expert_used_count"):
+        value = metadata.values.get(f"{arch}.{key}")
+        if (
+            type(value) is not list
+            or len(value) < layers
+            or not all(type(v) is int and v >= 0 for v in value)
+        ):
+            raise ModelError("missing or invalid GGUF metadata array: " + key)
+        arrays[key] = value[:layers]
+    kinds = []
+    for ffn, kv, used in zip(
+        arrays["feed_forward_length"],
+        arrays["attention.head_count_kv"],
+        arrays["expert_used_count"],
+    ):
+        if (ffn and kv) or bool(ffn) != bool(used):
+            raise ModelError("GGUF layer arrays name no single block")
+        kinds.append("moe" if ffn else "attention" if kv else "mamba")
+    return kinds
+
+
 def loaded_tensors(metadata):
     """Each tensor the native loader reads from the target that metadata
     describes, with the types it accepts. MTP layers are not loaded; in a
@@ -780,6 +884,13 @@ def loaded_tensors(metadata):
     the two. A PLE layer reads the n-gram embedding's tensors too."""
     arch = text_architecture(metadata)
     architecture = ARCHITECTURES[arch]
+    tensors = dict(architecture.model_tensors)
+    if architecture.single_blocks:
+        for layer, kind in enumerate(nemotron_blocks(metadata)):
+            parts = architecture.layer_tensors | NEMOTRON_BLOCK_TENSORS[kind]
+            for name, types in parts.items():
+                tensors[f"blk.{layer}.{name}"] = types
+        return tensors
     period = (
         metadata.positive(arch + ".full_attention_interval")
         if architecture.hybrid
@@ -787,7 +898,6 @@ def loaded_tensors(metadata):
     )
     dense = dense_layers(metadata, arch)
     fused = fused_experts(architecture.moe_tensors)
-    tensors = dict(architecture.model_tensors)
     for layer in range(loaded_layers(metadata, arch)):
         if (layer + 1) % period == 0:
             mixer = ATTENTION_TENSORS | architecture.attention_tensors
@@ -816,6 +926,8 @@ def require_arrays(metadata):
     ple.layers, that layer alone. One error names every mismatch."""
     arch = text_architecture(metadata)
     architecture = ARCHITECTURES[arch]
+    if architecture.single_blocks:
+        nemotron_blocks(metadata)
     mismatched = []
     if architecture.qsa_block is not None:
         period = metadata.positive(arch + ".full_attention_interval")
@@ -936,7 +1048,16 @@ def require_loadable(metadata):
         # llama.cpp multiplies a weight's products by a .scale tensor beside
         # it; the loader folds one into NVFP4's rows only.
         stem = name.removesuffix(".weight")
-        if stem != name and stem + ".scale" in metadata.tensors and found != "NVFP4":
+        scaled = (
+            name.split(".", 2)[-1] in SCALED_TENSORS
+            and ARCHITECTURES[text_architecture(metadata)].single_blocks
+        )
+        if (
+            stem != name
+            and stem + ".scale" in metadata.tensors
+            and found != "NVFP4"
+            and not scaled
+        ):
             scale = short.removesuffix(".weight") + ".scale"
             unsupported[scale, f"beside {found}"] += 1
     if unsupported:

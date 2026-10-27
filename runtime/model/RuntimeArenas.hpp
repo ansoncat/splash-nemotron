@@ -81,12 +81,13 @@ struct RuntimeGeometry final {
     result.target.ropeScaling = model.descriptor.ropeScaling;
     if (parts.kv) result.spilledKv = model.descriptor.capabilities.sparseKv;
     if (parts.experts || parts.kv) result.prefillChunks = kPrefillGroupChunks;
-    if (!result.target.valid() || !result.draft.stateLayout().valid() ||
+    const auto &draft = result.draft;
+    if (!result.target.valid() ||
         (parts.kv && (!result.spilledKv || !result.target.kvLayout.spillable())) ||
         result.target.contextTokens() != model.descriptor.capabilities.maximumContextTokens ||
-        result.target.hiddenSize != result.draft.hiddenSize ||
-        result.target.vocabularySize != result.draft.vocabularySize ||
-        result.target.capturedHiddenSize() != result.draft.targetHiddenSize()) {
+        result.target.capturedHiddenSize() != draft.targetHiddenSize() ||
+        (draft.present() && (!draft.stateLayout().valid() || result.target.hiddenSize != draft.hiddenSize ||
+                             result.target.vocabularySize != draft.vocabularySize))) {
       throw std::invalid_argument("invalid model runtime geometry");
     }
     // Sized from the geometry, once it is valid.
@@ -244,7 +245,7 @@ public:
         get(PrefillTensor::TargetInverseFrequencies).contents());
     auto *draft = static_cast<float *>(
         get(PrefillTensor::DraftInverseFrequencies).contents());
-    if (!target || !draft)
+    if (!target || (!draft && geometry.draft.present()))
       throw std::logic_error("RoPE frequencies are not CPU-visible");
     rotaryInverseFrequencies(geometry.target.rotaryTheta, geometry.target.rotaryPairs,
                              geometry.target.ropeScaling,
@@ -511,8 +512,8 @@ public:
     // One private gate buffer is reused serially by the target dense FFN (when
     // present) and the always-dense DFlash draft. Sparse target FFNs use their
     // own route-major arena tensors, but must not remove the draft's scratch.
-    const uint64_t draft = operators.gateUpWorkspace(
-        {geometry.draft.intermediateSize, geometry.draft.hiddenSize});
+    const uint64_t draft = geometry.draft.present() ? operators.gateUpWorkspace(
+        {geometry.draft.intermediateSize, geometry.draft.hiddenSize}) : 0;
     uint64_t target = 0;
     for (const auto &p : geometry.target.gateUpProjections)
       target = std::max(target, operators.gateUpWorkspace(p));

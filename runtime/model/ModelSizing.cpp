@@ -27,7 +27,10 @@ uint64_t loadedBytes(std::span<const gguf::Image> images) {
 // the routed experts' slot table with them.
 template <class Layout, class Plan>
 StreamableWeights targetWeights(const Layout &layout, const Plan &plan, gguf::PlanOptions streams) {
-  streams.streamExperts = streams.streamExperts && layout.ffnKind == QwenFfnKind::SparseMoe;
+  // Nemotron-H's experts load with their layers: its planner keeps no
+  // streamed expert blocks.
+  streams.streamExperts = streams.streamExperts && layout.ffnKind == QwenFfnKind::SparseMoe &&
+                          !std::is_same_v<Layout, NemotronHLayout>;
   StreamableWeights result;
   std::vector<gguf::Image> streamed;
   try {
@@ -84,7 +87,7 @@ StreamableWeights streamableWeights(const std::filesystem::path &root, const Mod
             streams);
       },
       descriptor.target);
-  result.loadedBytes += draftImageBytes(root / "draft", descriptor.draft);
+  if (descriptor.draft.present()) result.loadedBytes += draftImageBytes(root / "draft", descriptor.draft);
   if (descriptor.hasVision()) result.loadedBytes += visionImageBytes(descriptor.vision);
   return result;
 }

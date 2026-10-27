@@ -3,6 +3,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
 #include "model/GgufImageLayout.hpp"
+#include "model/NemotronH.hpp"
 #include "model/StateLayout.hpp"
 #include "model/WeightLayout.hpp"
 
@@ -323,6 +324,11 @@ public:
 
   Image finish() { return image_.finish(); }
 
+  // Q8_0 projections whose .scale the writer folds into their block scales
+  // (TensorRows::ggufScaledQ8_0): a Nemotron-H GGUF's Mamba-2 projections,
+  // which llama.cpp multiplies by their .scale, as converted from NVFP4.
+  void allowScaledQ8_0(bool allow) { scaledQ8_0_ = allow; }
+
 private:
   void reject(const std::string &name, const GgufTensor *tensor) {
     problems_.push_back(name + (tensor ? " (" + ggmlTypeName(tensor->type) + ")" : " (missing)"));
@@ -353,11 +359,18 @@ private:
     const std::string stem = tensor.name.ends_with(".weight") ? tensor.name.substr(0, tensor.name.size() - 7) : "";
     const GgufTensor *scale = stem.empty() ? nullptr : file_.find(stem + ".scale");
     if (tensor.type != ggml::kNVFP4) {
-      if (scale)
+      if (scale && !(tensor.type == ggml::kQ8_0 && scaledQ8_0_))
         throw GgufError(scale->name + " scales a " + ggmlTypeName(tensor.type) +
                         " tensor; Splash reads a .scale tensor beside an NVFP4 weight only");
       if (!count || count * rowBytes != tensor.bytes) throw GgufError("unexpected size for " + tensor.name);
-      return {tensor.name, tensor.type, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
+      TensorRows rows{tensor.name, tensor.type, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
+      if (scale) {
+        if (scale->type != ggml::kF32 || scale->elements() != 1)
+          throw GgufError(scale->name + " must hold one F32 value for " + tensor.name);
+        rows.scale = {&file_.source(scale->file), scale->offset, scale->bytes, count};
+        rows.ggufScaledQ8_0 = true;
+      }
+      return rows;
     }
     const QuantFormat &format = kQuantFormats[GGUF_FMT_NVFP4];
     const GgmlTypeTraits &blocks = *ggmlTypeTraits(ggml::kNVFP4);
@@ -400,6 +413,7 @@ private:
   const QwenTargetDimensions &geometry_;
   std::vector<std::string> &problems_;
   ImageBuilder image_;
+  bool scaledQ8_0_ = false;
 };
 
 std::string prefix(uint32_t layer) { return "blk." + std::to_string(layer) + "."; }
@@ -563,6 +577,120 @@ struct Qwen4ExpGguf final {
   }
 };
 
+// Nemotron-H's GGUFs (nemotron_h_moe, model/NemotronH.hpp): one block a layer
+// behind its norm, Mamba-2, NoPE attention or a latent MoE, as the layout's
+// block table names them; the head's norm before the logits. Its metadata
+// keys are its own (requireMetadata), and its arrays must name the layout's
+// blocks, expert counts and widths. Tensors keep their GGUF types and order:
+// the Mamba-2 vectors and convolution F32 as stored, the router F32 or BF16.
+struct NemotronHGguf final {
+  static constexpr std::string_view architecture = NemotronHLayout::ggufArchitecture;
+  static constexpr NemotronHLayout kLayout{};
+
+  template <class Expect, class ExpectFloat>
+  static void metadata(const Expect &, const ExpectFloat &, const QwenTargetDimensions &) {}
+
+  template <class Expect, class ExpectFloat>
+  static void requireMetadata(const Expect &expect, const ExpectFloat &expectFloat, const QwenTargetDimensions &g) {
+    expect("block_count", g.layers);
+    expect("embedding_length", g.hiddenSize);
+    expect("attention.head_count", g.attentionQueryHeads);
+    expect("attention.key_length", g.attentionHeadDimension);
+    expect("attention.value_length", g.attentionHeadDimension);
+    expectFloat("attention.layer_norm_rms_epsilon", kLayout.rmsEpsilon);
+    expect("ssm.conv_kernel", kGdnConvolutionTaps);
+    expect("ssm.group_count", g.gdnKeyHeads);
+    expect("ssm.time_step_rank", g.gdnValueHeads);
+    expect("ssm.state_size", g.gdnHeadDimension);
+    expect("ssm.inner_size", kLayout.mambaInnerSize);
+    expect("expert_count", g.experts);
+    expect("expert_shared_feed_forward_length", kLayout.sharedIntermediateSize);
+    expect("expert_shared_count", 1);
+    expect("moe_latent_size", kLayout.moeLatentSize);
+    expect("expert_gating_func", 2); // sigmoid
+    expect("expert_weights_norm", 1);
+    expectFloat("expert_weights_scale", kLayout.routedScale);
+  }
+
+  // Per layer: feed_forward_length and expert_feed_forward_length the MoE
+  // width, head_count_kv the attention's KV heads and expert_used_count the
+  // experts a MoE takes, each 0 where the layer has none.
+  static void arrays(const GgufFile &file, const QwenTargetDimensions &g) {
+    const std::string arch(architecture);
+    std::string mismatched;
+    const auto check = [&](const char *key, auto value) {
+      const auto found = file.numericArray(arch + "." + key);
+      bool ok = found && found->size() >= g.layers;
+      for (uint32_t layer = 0; ok && layer < g.layers; ++layer) ok = (*found)[layer] == value(layer);
+      if (!ok) mismatched += (mismatched.empty() ? "" : ", ") + std::string(key);
+    };
+    const auto moe = [](uint32_t layer) { return NemotronHLayout::block(layer) == NemotronBlock::Moe; };
+    check("feed_forward_length", [](uint32_t layer) { return NemotronHLayout::layerExpertWidth(layer); });
+    check("expert_feed_forward_length", [](uint32_t layer) { return NemotronHLayout::layerExpertWidth(layer); });
+    check("attention.head_count_kv", [&](uint32_t layer) {
+      return NemotronHLayout::block(layer) == NemotronBlock::Attention ? g.attentionKvHeads : 0;
+    });
+    check("expert_used_count", [&](uint32_t layer) { return moe(layer) ? g.expertsPerToken : 0; });
+    if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
+  }
+
+  static uint32_t imageType(uint32_t index) {
+    switch (NemotronHLayout::block(index)) {
+    case NemotronBlock::Mamba: return 0;
+    case NemotronBlock::Attention: return 1;
+    case NemotronBlock::Moe: return 4;
+    }
+    return 0;
+  }
+
+  static void layer(Builder &b, const QwenTargetDimensions &g, uint32_t index) {
+    const std::string p = prefix(index);
+    const uint64_t hidden = g.hiddenSize;
+    b.floatNorm(p + "attn_norm.weight", hidden);
+    switch (NemotronHLayout::block(index)) {
+    case NemotronBlock::Mamba: {
+      const uint64_t channels = g.convolutionDimension, heads = g.gdnValueHeads, inner = kLayout.mambaInnerSize;
+      b.allowScaledQ8_0(true);
+      b.quantized(p + "ssm_in.weight", kLayout.mambaInProjectionRows, hidden);
+      b.floatNorm(p + "ssm_conv1d.weight", channels * kGdnConvolutionTaps);
+      b.floatNorm(p + "ssm_conv1d.bias", channels);
+      b.floatNorm(p + "ssm_dt.bias", heads);
+      b.floatNorm(p + "ssm_a", heads);
+      b.floatNorm(p + "ssm_d", heads);
+      b.floatNorm(p + "ssm_norm.weight", inner);
+      b.quantized(p + "ssm_out.weight", hidden, inner);
+      b.allowScaledQ8_0(false);
+      break;
+    }
+    case NemotronBlock::Attention: {
+      const uint64_t kvRows = uint64_t{g.attentionKvHeads} * g.attentionHeadDimension;
+      b.quantized(p + "attn_q.weight", g.attentionWidth, hidden);
+      b.quantized(p + "attn_k.weight", kvRows, hidden);
+      b.quantized(p + "attn_v.weight", kvRows, hidden);
+      b.quantized(p + "attn_output.weight", hidden, g.attentionWidth);
+      break;
+    }
+    case NemotronBlock::Moe: {
+      const uint64_t experts = NemotronHLayout::layerExperts(index),
+                     width = NemotronHLayout::layerExpertWidth(index), latent = kLayout.moeLatentSize,
+                     shared = kLayout.sharedIntermediateSize;
+      b.floatTensor(p + "ffn_gate_inp.weight", experts, hidden);
+      b.floatNorm(p + "exp_probs_b.bias", experts);
+      b.quantized(p + "ffn_latent_down.weight", latent, hidden);
+      b.expertTensor(p + "ffn_up_exps.weight", experts * width, latent);
+      b.expertTensor(p + "ffn_down_exps.weight", experts * latent, width);
+      b.quantized(p + "ffn_latent_up.weight", hidden, latent);
+      b.quantized(p + "ffn_up_shexp.weight", shared, hidden);
+      b.quantized(p + "ffn_down_shexp.weight", hidden, shared);
+      break;
+    }
+    }
+  }
+  static void head(Builder &b, const QwenTargetDimensions &g) { b.floatNorm("output_norm.weight", g.hiddenSize); }
+  static void tables(const GgufFile &, const QwenTargetDimensions &, PlanOptions, std::vector<std::string> &,
+                     std::vector<Image> &) {}
+};
+
 // Flint's GGUFs (flint): every layer attends, those sliding_window_pattern
 // names over a sliding window and those rope_pattern names with RoPE, each
 // with its learned sinks after its mixer (attn_sinks, an F32 per query head,
@@ -627,12 +755,18 @@ struct FlintGguf final {
 };
 
 // Calls `use` with what the GGUFs of `architecture` hold: Qwen3.8-Flash-Next's
-// (Qwen4ExpGguf), Flint's (FlintGguf), or else the Qwen3.5 hybrid's
-// (HybridGguf).
+// (Qwen4ExpGguf), Nemotron-H's (NemotronHGguf), Flint's (FlintGguf), or else
+// the Qwen3.5 hybrid's (HybridGguf).
 template <class Use> decltype(auto) withFamily(std::string_view architecture, Use &&use) {
   if (architecture == Qwen4ExpGguf::architecture) return use(Qwen4ExpGguf{});
+  if (architecture == NemotronHGguf::architecture) return use(NemotronHGguf{});
   if (architecture == FlintGguf::architecture) return use(FlintGguf{});
   return use(HybridGguf{});
+}
+
+template <class Family> uint32_t layerImageType(const QwenTargetDimensions &g, uint32_t index) {
+  if constexpr (std::is_same_v<Family, NemotronHGguf>) return NemotronHGguf::imageType(index);
+  else return g.isFullAttentionLayer(index) ? 1u : 0u;
 }
 
 // The images of a target from a GGUF of Family (planImages).
@@ -643,7 +777,7 @@ std::vector<Image> familyImages(const GgufFile &file, const QwenTargetDimensions
   std::vector<Image> images;
   for (uint32_t index = 0; index < g.layers; ++index) {
     Builder layer(file, g, problems, "layer-" + std::to_string(index) + ".bin", index,
-                  g.isFullAttentionLayer(index) ? 1u : 0u, options);
+                  layerImageType<Family>(g, index), options);
     Family::layer(layer, g, index);
     images.push_back(layer.finish());
   }
@@ -825,6 +959,11 @@ void requireMetadata(const GgufMetadata &metadata, std::string_view architecture
     text << " (expected " << value << ')';
     mismatched += text.str();
   };
+  if (architecture == NemotronHGguf::architecture) {
+    NemotronHGguf::requireMetadata(expect, expectFloat, geometry);
+    if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
+    return;
+  }
   expect("block_count", geometry.layers + metadata.unsignedValue(arch + ".nextn_predict_layers").value_or(0));
   expect("embedding_length", geometry.hiddenSize);
   expect("attention.head_count", geometry.attentionWidth / geometry.attentionHeadDimension);

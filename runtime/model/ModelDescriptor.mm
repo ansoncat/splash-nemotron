@@ -887,7 +887,7 @@ bool ModelDescriptor::valid() const noexcept {
       !capabilities.maximumContextTokens ||
       !targetKvLayout.valid() || !stateLayout.valid() ||
       stateLayout.draft != draft.stateLayout() ||
-      vision.outputHiddenSize != draft.hiddenSize) {
+      (draft.present() && vision.outputHiddenSize != draft.hiddenSize)) {
     return false;
   }
   return std::visit(
@@ -902,12 +902,13 @@ bool ModelDescriptor::valid() const noexcept {
                  capabilities.maximumContextTokens <= layout.yarnContextTokens)) &&
                capabilities.sparseKv == sparseKvShape(layout) &&
                (!capabilities.sparseKv || capabilities.sparseKv->blockTokens == SPLASH_ATTENTION_BLOCK_TOKENS) &&
-               layout.hiddenSize == draft.hiddenSize &&
-               draft.targetLayerCount && draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
-               draft.targetLayers[draft.targetLayerCount - 1] < layout.layers &&
-               // A family whose drafts choose the mask token holds its draft's.
-               (!layout.draftChoosesMaskToken() ||
-                (layout.maskToken >= layout.firstDraftMaskToken && layout.maskToken <= layout.lastDraftMaskToken)) &&
+               (draft == DFlashDraftLayout{} ||
+                (layout.hiddenSize == draft.hiddenSize && draft.targetLayerCount &&
+                 draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
+                 draft.targetLayers[draft.targetLayerCount - 1] < layout.layers &&
+                 // A family whose drafts choose the mask token holds its draft's.
+                 (!layout.draftChoosesMaskToken() ||
+                  (layout.maskToken >= layout.firstDraftMaskToken && layout.maskToken <= layout.lastDraftMaskToken)))) &&
                layout.kvLayout() == targetKvLayout &&
                layout.gdnStateLayout() == stateLayout.target;
       },
@@ -942,11 +943,13 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
     const std::string targetFormat = requireString(record, @"target_format", "target format");
     const std::string visionFormat = requireString(record, @"vision_format", "vision format");
     NSDictionary *config = readObject(root / "config.json", "upstream model config");
-    // Every family decodes with its DFlash2 draft, in draft/.
-    if (!std::filesystem::exists(root / "draft"))
-      throw std::invalid_argument("the model's root holds no draft/ for its DFlash2 draft");
-    NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
+    // Every family decodes with its DFlash2 draft, in draft/, but Nemotron-H,
+    // which has none (DFlashDraftLayout::present).
+    const bool hasDraft = std::filesystem::exists(root / "draft");
+    NSDictionary *draft = hasDraft ? readObject(root / "draft" / "config.json", "draft config") : nil;
     ModelDescriptor result = describeSourceModel(std::move(name), targetFormat, visionFormat, config, draft);
+    if (!hasDraft && !std::holds_alternative<NemotronHLayout>(result.target))
+      throw std::invalid_argument("the model's root holds no draft/ for its DFlash2 draft");
     result.sourceIdentity = std::move(sourceIdentity);
     if (!result.valid()) throw std::invalid_argument("incompatible target and draft model");
     return result;

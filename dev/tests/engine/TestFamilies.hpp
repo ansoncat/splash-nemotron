@@ -15,11 +15,12 @@ namespace splash::test {
 // the families' order, which the kernel tests take so that every family's
 // kernels are tested, a new family's with no edit here.
 
-// Each family's GDN shape, of the families with GDN layers.
+// Each family's GDN shape, of the families with GDN layers; Nemotron-H's
+// recurrent layers are Mamba-2's, of kernels of their own.
 [[nodiscard]] inline std::vector<ops::GdnShape> familyGdnShapes() {
   std::vector<ops::GdnShape> shapes;
   model::forEachFamily([&](const auto &family) {
-    if (!family.gdnLayerCount()) return;
+    if (family.singleBlockLayers() || !family.gdnLayerCount()) return;
     const ops::GdnShape shape{family.gdnKeyHeads,          family.gdnValueHeads,  family.gdnHeadDimension,
                               family.convolutionDimension, family.packedGdnWidth, family.gdnSigmoidGate};
     if (std::find(shapes.begin(), shapes.end(), shape) == shapes.end()) shapes.push_back(shape);

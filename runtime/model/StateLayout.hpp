@@ -110,8 +110,10 @@ struct CompositeStateLayout final {
   GdnStateLayout target;
   DraftStateLayout draft;
 
+  // A target without a draft has no rings and no context window: an empty
+  // draft layout (DFlashDraftLayout::present).
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return target.valid() && draft.valid();
+    return target.valid() && (draft == DraftStateLayout{} || draft.valid());
   }
   [[nodiscard]] constexpr uint64_t laneBytes() const noexcept {
     return kLaneGdnCells * target.cellBytes() + draft.ringBytes() +
