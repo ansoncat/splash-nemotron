@@ -748,9 +748,11 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
 
 // The vision tower's config, config.json's vision_config, which the
 // installer derives from a GGUF's mmproj too: the tower the layout describes,
-// over RGB patches of two frames, without deepstack layers.
+// over RGB patches of two frames (RADIO's one, with erf GELU), without
+// deepstack layers.
 void validateVisionConfig(NSDictionary *vision, const ops::VisionLayout &layout,
                           TargetSource source) {
+  const bool radio = ops::isRadioVision(layout);
   requireNumbers(vision, sourceName(source), "vision config",
                  {{"depth", layout.depth},
                   {"hidden_size", layout.hiddenSize},
@@ -759,10 +761,10 @@ void validateVisionConfig(NSDictionary *vision, const ops::VisionLayout &layout,
                   {"out_hidden_size", layout.outputHiddenSize},
                   {"patch_size", layout.patchSize},
                   {"spatial_merge_size", layout.spatialMerge},
-                  {"temporal_patch_size", 2},
+                  {"temporal_patch_size", radio ? 1U : 2U},
                   {"in_channels", ops::kImageChannels},
                   {"num_position_embeddings", layout.positionGridSide * layout.positionGridSide}});
-  requireEqual(requireString(vision, @"hidden_act", "vision config hidden_act"), "gelu_pytorch_tanh",
+  requireEqual(requireString(vision, @"hidden_act", "vision config hidden_act"), radio ? "gelu" : "gelu_pytorch_tanh",
                sourceName(source), "vision config hidden_act");
   if (requireArray(vision, @"deepstack_visual_indexes", "vision config deepstack_visual_indexes").count)
     throw std::invalid_argument("vision deepstack layers are unsupported");
@@ -822,10 +824,13 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
     if (draft && layout.draftChoosesMaskToken()) layout.maskToken = draftMaskToken(draft, layout);
     if (draft) dflashLayout = readDraftLayout(draft, layout);
   }, *target);
-  ModelDescriptor result = makeModelDescriptor(std::move(name), *target, dflashLayout,
-                                               {.outputHiddenSize = std::visit(
-                                                    [](const auto &layout) { return layout.hiddenSize; }, *target)},
-                                               targetSource, visionSource);
+  // Nemotron-H's tower is RADIO, every other family's Qwen3.5's; each
+  // projects into its text model's width.
+  ops::VisionLayout vision =
+      std::holds_alternative<NemotronHLayout>(*target) ? ops::kRadioVisionLayout : ops::VisionLayout{};
+  vision.outputHiddenSize = std::visit([](const auto &layout) { return layout.hiddenSize; }, *target);
+  ModelDescriptor result =
+      makeModelDescriptor(std::move(name), *target, dflashLayout, vision, targetSource, visionSource);
   if (result.hasVision())
     validateVisionConfig(requireObject(config, @"vision_config", "vision config"), result.vision,
                          result.targetSource);

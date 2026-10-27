@@ -1,6 +1,7 @@
 import contextlib
 import dataclasses
 import io
+import json
 import math
 import re
 import shutil
@@ -787,6 +788,59 @@ class GgufMetadataTests(unittest.TestCase):
                 self.assertRaisesRegex(models.ModelError, reason),
             ):
                 gguf.vision_config(self.metadata(values))
+
+    def test_vision_config_of_radio_reads_its_position_table(self):
+        values = vision_fixture() | {
+            "clip.projector_type": "nemotron_omni",
+            "clip.vision.block_count": 32,
+            "clip.vision.embedding_length": 1280,
+            "clip.vision.feed_forward_length": 5120,
+            "clip.vision.projection_dim": 4096,
+            "clip.vision.projector.scale_factor": 2,
+            "clip.vision.image_size": 512,
+        }
+
+        def config(shape):
+            path = fixture_files.write_gguf(
+                self.root / "radio.gguf",
+                values,
+                [("v.position_embd.weight", shape, 0, b"")],
+            )
+            return gguf.vision_config(gguf.Metadata(path, tensors=True))
+
+        # A 128 x 128 table, whatever image_size (512) says.
+        self.assertEqual(
+            config([1280, 16384]),
+            {
+                "depth": 32,
+                "hidden_size": 1280,
+                "num_heads": 16,
+                "intermediate_size": 5120,
+                "out_hidden_size": 4096,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "temporal_patch_size": 1,
+                "in_channels": 3,
+                "num_position_embeddings": 16384,
+                "hidden_act": "gelu",
+                "deepstack_visual_indexes": [],
+            },
+        )
+        for shape in ([1152, 16384], [16384], [1280, 128, 128]):
+            with (
+                self.subTest(shape=shape),
+                self.assertRaisesRegex(
+                    models.ModelError, "invalid GGUF vision position grid"
+                ),
+            ):
+                config(shape)
+        # The metadata an installation derives reads the table too.
+        config([1280, 16384])
+        target = write_gguf(self.root / "target.gguf", fixture())
+        derived = json.loads(
+            gguf.derived_files(target, self.root / "radio.gguf")["config.json"]
+        )
+        self.assertEqual(derived["vision_config"]["num_position_embeddings"], 16384)
 
     def derived(self, models_root, path):
         """The metadata derived from a target GGUF, as installations derive

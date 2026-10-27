@@ -202,7 +202,9 @@ def derived_files(target, vision=None):
     """DERIVED_FILES' contents, derived from a target GGUF's metadata and its
     vision projector's (local paths)."""
     metadata = Metadata(target)
-    config = model_config(metadata, None if vision is None else Metadata(vision))
+    # A RADIO projector's position grid is its table's extents.
+    vision = None if vision is None else Metadata(vision, tensors=True)
+    config = model_config(metadata, vision)
     return {"config.json": models.json_bytes(config), **tokenizer_files(metadata)}
 
 
@@ -486,12 +488,17 @@ def flint_text_config(metadata, arch):
 
 
 def vision_config(vision):
+    """The vision_config of a clip mmproj: Qwen3.5's tower (qwen3vl_merger),
+    or Nemotron 3.5 Bolt's RADIO (nemotron_omni, radio_vision_config)."""
+    projector = vision.require("clip.projector_type", str)
     if (
         vision.require("general.architecture", str) != "clip"
-        or vision.require("clip.projector_type", str) != "qwen3vl_merger"
+        or projector not in ("qwen3vl_merger", "nemotron_omni")
         or vision.require("clip.use_gelu", bool) is not True
     ):
         raise ModelError("unsupported GGUF vision architecture")
+    if projector == "nemotron_omni":
+        return radio_vision_config(vision)
     fields = {
         "depth": "block_count",
         "hidden_size": "embedding_length",
@@ -516,6 +523,37 @@ def vision_config(vision):
         in_channels=3,
         num_position_embeddings=(image_size // result["patch_size"]) ** 2,
         hidden_act="gelu_pytorch_tanh",
+        deepstack_visual_indexes=[],
+    )
+    return result
+
+
+def radio_vision_config(vision):
+    """RADIO's vision_config, the keys of Qwen3.5's (the engine checks both,
+    ModelDescriptor.mm): one-frame RGB patches, erf GELU, the 2x2 merge its
+    projector states as scale_factor, and the position grid of its table,
+    v.position_embd.weight [hidden, cells], which its image_size (the
+    preprocessing's) does not give. The header must be read with tensors."""
+    fields = {
+        "depth": "block_count",
+        "hidden_size": "embedding_length",
+        "num_heads": "attention.head_count",
+        "intermediate_size": "feed_forward_length",
+        "out_hidden_size": "projection_dim",
+        "patch_size": "patch_size",
+        "spatial_merge_size": "projector.scale_factor",
+    }
+    result = {
+        name: vision.positive("clip.vision." + key) for name, key in fields.items()
+    }
+    extents = vision.extents.get("v.position_embd.weight")
+    if not extents or len(extents) != 2 or extents[0] != result["hidden_size"]:
+        raise ModelError("invalid GGUF vision position grid")
+    result.update(
+        temporal_patch_size=1,
+        in_channels=3,
+        num_position_embeddings=extents[1],
+        hidden_act="gelu",
         deepstack_visual_indexes=[],
     )
     return result
