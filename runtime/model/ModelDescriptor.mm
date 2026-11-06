@@ -870,7 +870,7 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
   std::visit(
       [&](const auto &layout) {
         result.capabilities = {layout.vocabularySize,
-                               layout.nativeContextTokens, sparseKvShape(layout)};
+                               layout.servedContextTokens({}), sparseKvShape(layout)};
         result.targetKvLayout = layout.kvLayout();
         result.stateLayout = {layout.gdnStateLayout(), draft.stateLayout()};
       },
@@ -917,7 +917,7 @@ ModelDescriptor servedFor(ModelDescriptor model, uint32_t contextTokens) {
     throw std::invalid_argument("the target's RoPE is already scaled");
   std::visit(
       [&](const auto &layout) {
-        if (contextTokens <= layout.nativeContextTokens)
+        if (contextTokens <= layout.servedContextTokens({}))
           return;
         if (contextTokens > layout.yarnContextTokens)
           throw std::invalid_argument(

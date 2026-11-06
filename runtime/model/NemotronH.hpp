@@ -163,7 +163,7 @@ struct NemotronHLayout final : QwenHybridLayout {
 };
 
 // Nemotron 3.5 Super: Bolt's blocks and widths but for its experts and a
-// 1M-token window.
+// 1M-token window, served to kMaximumServedContextTokens.
 inline constexpr NemotronHLayout kNemotronSuperLayout{[] {
   QwenHybridLayout family = NemotronHLayout{};
   family.nativeContextTokens = 1'048'576;
@@ -174,6 +174,7 @@ inline constexpr NemotronHLayout kNemotronSuperLayout{[] {
   return family;
 }()};
 static_assert(!NemotronHLayout::boltTables(kNemotronSuperLayout) && kNemotronSuperLayout.moeBlockShape().valid());
+static_assert(kNemotronSuperLayout.maximumContextTokens() == kMaximumServedContextTokens);
 
 static_assert(NemotronHLayout::boltTables(NemotronHLayout{}) && NemotronHLayout{}.moeBlockShape().valid());
 static_assert(NemotronHLayout{}.attentionLayerCount() == 8 && NemotronHLayout{}.recurrentLayerCount() == 40);

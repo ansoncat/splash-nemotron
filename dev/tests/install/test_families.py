@@ -39,11 +39,12 @@ UNUSABLE = {
     "Nemotron-3.5-Super": {"--ple-memory", "--sparse-kv-memory", "--disable-ane"},
 }
 # The context each family serves natively and at most, where it is not the
-# Qwen families' 262144 stretched by YaRN to 1010000.
+# Qwen families' 262144 stretched by YaRN to 1010000; Super's native window is
+# served to that bound.
 CONTEXT = {
     "Flint": (262144, 262144),
     "Nemotron-3.5-Bolt": (262144, 262144),
-    "Nemotron-3.5-Super": (1048576, 1048576),
+    "Nemotron-3.5-Super": (1048576, 1010000),
 }
 
 
@@ -57,8 +58,8 @@ class OptionReportTests(unittest.TestCase):
             {name: set(family["unusable"]) for name, family in report.items()},
             UNUSABLE,
         )
-        # Flint and Nemotron serve their native windows alone; YaRN stretches
-        # the others'.
+        # Flint and Nemotron serve their native windows alone, Super's to the
+        # bound below; YaRN stretches the others'.
         self.assertEqual(
             {
                 name: (family["context_tokens"], family["max_context_tokens"])
@@ -66,16 +67,10 @@ class OptionReportTests(unittest.TestCase):
             },
             {name: CONTEXT.get(name, (262144, 1010000)) for name in UNUSABLE},
         )
-        # --max-context takes at most the most context any family serves
-        # through YaRN; Super's native window, above it, keeps upstream's
-        # bound in this fork.
+        # --max-context takes at most the most context any family serves.
         self.assertEqual(
             serve_options.MAX_YARN_CONTEXT_TOKENS,
-            max(
-                facts["max_context_tokens"]
-                for name, facts in engine_facts.items()
-                if name != "Nemotron-3.5-Super"
-            ),
+            max(facts["max_context_tokens"] for facts in engine_facts.values()),
         )
 
     def test_every_option_that_needs_a_fact_is_an_option_of_splash_serve(self):

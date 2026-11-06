@@ -6,6 +6,7 @@
 #include "ops/PagedKv.hpp"
 #include "ops/StopTokens.hpp"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -22,6 +23,11 @@ enum class QwenFfnKind : uint8_t { Dense, SparseMoe };
 // sparse MoE. A family's layout (QwenHybridLayout) sets them, and every view
 // of a target reads them from there: the target loaders, the GGUF planner
 // and the runtime's QwenTargetGeometry.
+// The most context Splash serves, as `splash serve --max-context` takes it
+// (serve_options.MAX_YARN_CONTEXT_TOKENS): a native window past it, as
+// Nemotron 3.5 Super's 1,048,576, is served to it.
+inline constexpr uint32_t kMaximumServedContextTokens = 1'010'000;
+
 struct QwenTargetDimensions {
   // The native window, the context max_position_embeddings states, and the
   // most context YaRN stretches it to (servedFor), as the family's model
@@ -172,13 +178,14 @@ struct QwenTargetDimensions {
   // context.
   [[nodiscard]] uint32_t servedContextTokens(const RopeScaling &scaling) const noexcept {
     if (!scaling.yarn())
-      return nativeContextTokens;
+      return std::min(nativeContextTokens, kMaximumServedContextTokens);
     return static_cast<uint32_t>(std::lround(nativeContextTokens * scaling.factor));
   }
   // The most context the target serves: YaRN's window, or the native one
-  // for a family YaRN does not stretch (yarnContextTokens 0).
+  // for a family YaRN does not stretch (yarnContextTokens 0), at most
+  // kMaximumServedContextTokens.
   [[nodiscard]] constexpr uint32_t maximumContextTokens() const noexcept {
-    return nativeContextTokens > yarnContextTokens ? nativeContextTokens : yarnContextTokens;
+    return std::min(std::max(nativeContextTokens, yarnContextTokens), kMaximumServedContextTokens);
   }
   // Whether the residual is hyperConnections streams, which a mix joins
   // before each mixer, each FFN and the logits in place of a norm.

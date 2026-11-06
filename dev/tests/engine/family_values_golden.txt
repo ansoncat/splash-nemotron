@@ -89,7 +89,7 @@ state bf16 cell 86507520 lane 219693056 cached 91226112
 namespace int8 bf16 23218cd24bfb2681d76066bf9a6a727c
 namespace bf16 bf16 8ca34a5ca78304da597a9197c7d6efad
 family Nemotron-3.5-Super
-facts experts 1 recurrent-state 1 ple-table 0 sparse-kv 0 dense-ffn 0 context 1048576..1048576
+facts experts 1 recurrent-state 1 ple-table 0 sparse-kv 0 dense-ffn 0 context 1048576..1010000
 kv layers 8 heads 2 dimension 128 index 0
 kv int8 page 135168 index-page 0 alignment 256 extents 512..1280
 kv int8 extent-pages 1:0 31:0 32:0 63:0 64:0 127:0 128:0 129:0 255:0 256:0 257:0 511:0 512:512 1000:768 4095:768 4096:1024 10000:768 65535:768 65536:1024 100000:768 262144:1024 1000000:768
