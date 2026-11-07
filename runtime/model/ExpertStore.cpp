@@ -1309,7 +1309,20 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
   // A decode step's loads keep the GPU awake: they come about every
   // millisecond and most end within one, about as long as an idle GPU takes
   // to come back to full speed; a prefill chunk's read for tens of ms.
-  const metal::HostStepGpu gpu = phase == ops::MoePhase::Decode ? metal::HostStepGpu::Awake : metal::HostStepGpu::Idle;
+  // Inline, the step taken up from the GPU's flag and its spin at the end of
+  // the buffer before it, the work after it resumes in 0.06-0.08 ms against
+  // 0.13 awake, and Nemotron 3.5 Super streaming at a 256K context decoded
+  // about 5% faster (llm-infra results/_super_splash/inline); the step reads
+  // the tiles and the prediction the GPU wrote, which it publishes.
+  const metal::HostStepGpu gpu =
+      phase == ops::MoePhase::Decode ? metal::HostStepGpu::Inline : metal::HostStepGpu::Idle;
+  std::vector<metal::MetalBuffer> published;
+  if (gpu == metal::HostStepGpu::Inline) {
+    for (const ops::MoeLoadPart &part : parts)
+      published.insert(published.end(), {part.buffers->scratch.tileCount, part.buffers->scratch.tileDescriptors});
+    if (predicted) published.insert(published.end(), {impl.predictionRoutes, impl.predictionWeights});
+    if (predicted && parts.front().buffers->verifyRows) published.push_back(parts.front().buffers->verifyRows);
+  }
   const auto timed = [impl = impl_, phase](const metal::HostStepTiming &timing) {
     Impl::StepTimes &times = impl->stepTimes[static_cast<size_t>(phase)];
     const auto nanoseconds = [](double seconds) { return uint64_t(seconds * 1e9); };
@@ -1325,7 +1338,7 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
         [impl = impl_, block, phase, rows, predicted, tiles, round, rounds, verifyRows] {
           impl->load(block, phase, rows, predicted, tiles, round, rounds, verifyRows);
         },
-        timed, gpu, startAhead);
+        timed, gpu, startAhead, round == 0 ? published : std::vector<metal::MetalBuffer>{});
     ops::MoE::addExpertLoad(graph, impl.staging, size.chunks, impl.jobs, impl.sources, size.load,
                             static_cast<uint32_t>(std::min<uint64_t>(routable, impl.places.count)),
                             metal::IndirectGrid{impl.grid, 0});
