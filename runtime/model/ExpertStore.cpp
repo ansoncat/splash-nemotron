@@ -181,9 +181,20 @@ Places stagingOf(const Geometry &g, ops::MoeShape shape) {
               2, std::min<uint64_t>(shape.experts, uint64_t{kCycleRows} * shape.expertsPerToken)))};
 }
 
+// The shape a decode step's prediction of the next block's routes selects
+// with: half again its routed experts, the extra ones after them. On
+// Nemotron 3.5 Super streaming at a 256K context, it read ahead 63% of the
+// experts decode steps missed against 52% at its routed experts, and decode
+// ran about 3% faster; twice them read 67% for twice the bytes and ran no
+// faster (llm-infra results/_super_splash/predict).
+ops::MoeShape predictionShape(ops::MoeShape shape) {
+  shape.expertsPerToken = std::min(shape.experts, shape.expertsPerToken + (shape.expertsPerToken + 1) / 2);
+  return shape;
+}
+
 uint64_t fixedBytesOf(const Geometry &g, uint32_t blocks, ops::MoeShape shape) {
   const uint64_t prediction =
-      uint64_t{kCycleRows} * (shape.routerWidth() + 2ULL * shape.routesPerToken()) * sizeof(float);
+      uint64_t{kCycleRows} * (shape.routerWidth() + 2ULL * predictionShape(shape).routesPerToken()) * sizeof(float);
   return stagingOf(g, shape).bytes() + uint64_t{blocks} * shape.experts * sizeof(uint32_t) +
          uint64_t{shape.experts} * (sizeof(uint32_t) + 3 * sizeof(uint64_t)) + 4 * sizeof(uint32_t) + prediction;
 }
@@ -653,11 +664,12 @@ std::span<const uint32_t> ExpertStore::Impl::predictedExperts(uint32_t index, ui
   const auto *weights = static_cast<const float *>(predictionWeights.contents());
   // The selector wrote them before the step's GPU work ran up to this load.
   const auto *verified = static_cast<const uint32_t *>(verifyRows.contents());
-  const uint32_t routes = shape.routesPerToken();
+  const ops::MoeShape predicted = predictionShape(shape);
+  const uint32_t routes = predicted.routesPerToken();
   predictionOrder.clear();
   for (uint64_t row = 0; row < rows; ++row) {
     if (verified && row % SPLASH_TARGET_VERIFY_ROWS >= verified[row / SPLASH_TARGET_VERIFY_ROWS]) continue;
-    for (uint32_t route = 0; route < shape.expertsPerToken; ++route) {
+    for (uint32_t route = 0; route < predicted.expertsPerToken; ++route) {
       const uint64_t at = row * routes + route;
       const uint32_t expert = selected[at];
       if (expert >= blocks[index].slot.size()) continue;
@@ -1216,8 +1228,8 @@ ExpertStore::ExpertStore(metal::MetalBackend &backend, StreamedBlocks streamed, 
                                   metal::BufferStorage::Shared, label);
   };
   impl.predictionScores = predictionBuffer(shape.routerWidth(), "experts/prediction-scores");
-  impl.predictionRoutes = predictionBuffer(shape.routesPerToken(), "experts/prediction-routes");
-  impl.predictionWeights = predictionBuffer(shape.routesPerToken(), "experts/prediction-weights");
+  impl.predictionRoutes = predictionBuffer(predictionShape(shape).routesPerToken(), "experts/prediction-routes");
+  impl.predictionWeights = predictionBuffer(predictionShape(shape).routesPerToken(), "experts/prediction-weights");
   impl.predictionSum.assign(shape.experts, -1);
   impl.jobs = backend.allocateBuffer(uint64_t{shape.experts} * sizeof(uint32_t), metal::BufferStorage::Shared,
                                      "experts/jobs");
@@ -1292,7 +1304,7 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
     const ops::MoeBuffers &buffers = *parts.front().buffers;
     ops::MoE::addRoutes(graph, buffers.routerInput ? buffers.routerInput : buffers.input, next.router,
                         next.scalarGate, impl.predictionScores, impl.predictionRoutes, impl.predictionWeights, rows,
-                        next.shape, parts.front().plan->configuration().ggufRouterTile, next.selectionBias);
+                        predictionShape(next.shape), parts.front().plan->configuration().ggufRouterTile, next.selectionBias);
   }
   // A decode step's loads keep the GPU awake: they come about every
   // millisecond and most end within one, about as long as an idle GPU takes
