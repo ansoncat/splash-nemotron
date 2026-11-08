@@ -1036,8 +1036,10 @@ void ExpertStore::Impl::load(uint32_t index, ops::MoePhase phase, uint32_t rows,
           throw std::runtime_error("a MoE block's tiles are out of bounds");
         partTiles.push_back({descriptors, counted->tiles});
       }
+      const uint64_t readBefore = use.read;
       route(index, partTiles, phase, rows, use);
       ++use.loads;
+      use.residentLoads += use.read == readBefore;
     } else if (pendingBlock != index) {
       throw std::logic_error("an expert load's round follows another block's load");
     } else if (pending.empty()) {

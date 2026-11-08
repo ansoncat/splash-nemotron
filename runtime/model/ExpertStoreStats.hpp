@@ -39,7 +39,8 @@ struct ExpertStoreStats final {
   // releaseAboveFloor() gives them back (the first is releaseUnitBytes).
   std::vector<uint64_t> releaseUnits;
   // Per ops::MoePhase, at its value (uses[0] prefill, uses[1] decode): the
-  // blocks loaded, the distinct experts they routed, those not resident and
+  // blocks loaded and of them those whose routed experts were all resident
+  // (no read), the distinct experts they routed, those not resident and
   // of them those read ahead, the experts read ahead whole (routed or not),
   // the bytes read from the sources (ahead or not, routed or not), and the
   // round trips of the loads' host steps, one per round (metal::
@@ -47,6 +48,7 @@ struct ExpertStoreStats final {
   // its work, its end to the GPU's work after it).
   struct Use final {
     uint64_t loads = 0;
+    uint64_t residentLoads = 0;
     uint64_t routed = 0;
     uint64_t read = 0;
     uint64_t prefetched = 0;

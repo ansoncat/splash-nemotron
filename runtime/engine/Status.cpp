@@ -185,7 +185,8 @@ void writeHostSteps(json::Writer &w, const model::LatencyStats &pickup, const mo
 // its cap and at its floor, its live chunks and those at the cap, the
 // chunks it gave back while memory was short and took back after, its live
 // chunks' bytes, its staging, its live slots and the experts resident in
-// them, per use (prefill, decode) its loads: the distinct experts they
+// them, per use (prefill, decode) its loads and those with every routed
+// expert resident: the distinct experts they
 // routed, those not resident (read) and of them those read ahead
 // (prefetched), the experts read ahead whole, the bytes read from the
 // sources and their host steps' round trips; and why a load failed, which
@@ -211,6 +212,7 @@ void writeStreamedExperts(json::Writer &w, const std::optional<model::ExpertStor
       const model::ExpertStoreStats::Use &counters = experts->uses[use];
       w.object(kStreamedUses[use], [&] {
         w.field("loads", counters.loads)
+            .field("resident_loads", counters.residentLoads)
             .field("routed", counters.routed)
             .field("read", counters.read)
             .field("prefetched", counters.prefetched)

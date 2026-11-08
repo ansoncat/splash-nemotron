@@ -728,6 +728,7 @@ void testStreamedExpertsStatus() {
                                   .shrinks = 2,
                                   .regrows = 1};
   experts.uses[1] = {.loads = 480,
+                     .residentLoads = 120,
                      .routed = 4000,
                      .read = 1000,
                      .prefetched = 600,
@@ -745,11 +746,11 @@ void testStreamedExpertsStatus() {
               "\"streamed_experts\":{\"cap_bytes\":18602770432,\"floor_bytes\":15837691904,\"chunks\":3,"
               "\"cap_chunks\":4,\"shrinks\":2,\"regrows\":1,\"arena_bytes\":17179869184,"
               "\"staging_bytes\":452984832,\"slots\":8192,"
-              "\"experts\":25088,\"resident\":8000,\"prefill\":{\"loads\":0,\"routed\":0,\"read\":0,\"prefetched\":0,"
+              "\"experts\":25088,\"resident\":8000,\"prefill\":{\"loads\":0,\"resident_loads\":0,\"routed\":0,\"read\":0,\"prefetched\":0,"
               "\"read_ahead\":0,\"hit_rate\":0,\"read_bytes\":0,\"host_steps\":{\"pickup_ms\":" +
               none + ",\"work_ms\":" + none + ",\"resume_ms\":" + none +
               "}},"
-              "\"decode\":{\"loads\":480,\"routed\":4000,\"read\":1000,\"prefetched\":600,"
+              "\"decode\":{\"loads\":480,\"resident_loads\":120,\"routed\":4000,\"read\":1000,\"prefetched\":600,"
               "\"read_ahead\":900,\"hit_rate\":0.75,\"read_bytes\":1973000000,\"host_steps\":"
               "{\"pickup_ms\":{\"p50\":0.032,\"p95\":0.032,\"p99\":0.064,\"max\":0.09,\"total\":11.5,"
               "\"samples\":500},\"work_ms\":{\"p50\":0.512,\"p95\":2.048,\"p99\":8.192,\"max\":9.5,"
