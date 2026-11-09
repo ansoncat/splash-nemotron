@@ -108,6 +108,14 @@ private:
   const Qwen4ExpWeights &weights_;
   // The step scratch and the inputs the target makes of a step's tokens.
   Qwen4Steps steps_;
+  // Each layer's control-vector direction (fp32 [hidden], unit), projected
+  // out of every stream after the layer; empty for a layer without one. Read
+  // from the controlvector GGUF SPLASH_CVEC names, its direction.N after
+  // layer N, for the N of SPLASH_CVEC_LAYERS ("first-last", inclusive;
+  // every direction it holds without it). No SPLASH_CVEC, none.
+  metal::MetalBuffer directions_;
+  std::vector<metal::MetalBuffer> projections_;
+  void addProjection(metal::CommandGraph &graph, metal::MetalBuffer streams, uint32_t index, uint32_t rows) const;
 };
 
 } // namespace splash::model

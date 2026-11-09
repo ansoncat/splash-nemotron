@@ -48,6 +48,10 @@ struct HyperConnection final {
   // weight.
   static void addCombine(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer branch,
                          metal::MetalBuffer weights, HyperShape shape, uint32_t rows);
+  // Each stream minus its component along the unit `direction` (fp32
+  // [hidden]): a control vector projected out after a block.
+  static void addProject(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer direction,
+                         HyperShape shape, uint32_t rows);
   // The mean of each of `rows` rows' streams, as bf16 into `destination` at
   // `to`: Qwen3.8-Flash-Next's capture of a layer's output for its DFlash2
   // draft.

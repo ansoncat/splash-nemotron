@@ -903,6 +903,37 @@ void streamMeanTest(MetalBackend &backend) {
   check(ok, "stream mean: each row's streams' mean, bf16, in its slot of wider rows");
 }
 
+// A control vector's projection: each row's each stream minus its component
+// along a unit direction, so that afterwards it is orthogonal to it.
+void projectTest(MetalBackend &backend) {
+  std::mt19937 rng(23);
+  const uint32_t rows = 3, hidden = kHidden, streams = kStreams, width = hidden * streams;
+  const ops::HyperShape shape{hidden, streams, 0};
+  const auto values = randoms(rng, rows * width, 2.0f);
+  auto direction = randoms(rng, hidden, 1.0f);
+  double norm = 0;
+  for (float v : direction) norm += double(v) * v;
+  for (float &v : direction) v = float(v / std::sqrt(norm));
+  MetalBuffer xs = upload(backend, values);
+  CommandGraph graph;
+  ops::HyperConnection::addProject(graph, xs, upload(backend, direction), shape, rows);
+  run(backend, graph);
+  const auto got = download<float>(xs, values.size());
+  bool ok = true;
+  for (uint32_t r = 0; r < rows; ++r)
+    for (uint32_t s = 0; s < streams; ++s) {
+      const float *in = values.data() + r * width + s * hidden, *out = got.data() + r * width + s * hidden;
+      double dot = 0, after = 0;
+      for (uint32_t d = 0; d < hidden; ++d) dot += double(in[d]) * direction[d];
+      for (uint32_t d = 0; d < hidden; ++d) {
+        ok &= std::fabs(out[d] - (in[d] - dot * direction[d])) <= 1e-4 * (1 + std::fabs(in[d]));
+        after += double(out[d]) * direction[d];
+      }
+      ok &= std::fabs(after) <= 1e-3;
+    }
+  check(ok, "project: every stream minus its component along the direction");
+}
+
 // The PLE hash on the GPU against the same hash on the CPU, as
 // model/Qwen4Steps.cpp's qwen4PleRows computes it, of three lanes of
 // SPLASH_TARGET_VERIFY_ROWS rows each.
@@ -1117,6 +1148,7 @@ int main(int argc, const char *argv[]) {
       } else {
         hyperTest(backend);
         hyperTableTest(backend);
+        projectTest(backend);
         hyperNormKernelsTest(backend, !std::getenv("MTL_SHADER_VALIDATION"));
         pleTest(backend);
         qsaTest(backend, {150, 20, 16, 0, 1, 7});

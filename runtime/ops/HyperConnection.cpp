@@ -113,6 +113,15 @@ void HyperConnection::addCombine(metal::CommandGraph &graph, metal::MetalBuffer 
             hyperParams(shape, rows), {rows, groups(shape.hidden), 1}, {kThreads, 1, 1});
 }
 
+void HyperConnection::addProject(metal::CommandGraph &graph, metal::MetalBuffer streams,
+                                 metal::MetalBuffer direction, HyperShape shape, uint32_t rows) {
+  requireShape(shape);
+  requireBytes(streams, streamBytes(shape, rows), "hyper-connection streams");
+  requireBytes(direction, uint64_t{shape.hidden} * sizeof(float), "hyper-connection direction");
+  graph.add("hyper_connection_project", {std::move(streams), std::move(direction)}, hyperParams(shape, rows),
+            {rows, 1, 1}, {kThreads, 1, 1});
+}
+
 void HyperConnection::addStreamMean(metal::CommandGraph &graph, metal::MetalBuffer streams,
                                     metal::MetalBuffer destination, RowRegion to, HyperShape shape, uint32_t rows) {
   requireShape(shape);

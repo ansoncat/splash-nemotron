@@ -1,6 +1,7 @@
 #include "model/Qwen4ExpTarget.hpp"
 
 #include "metal/abi/BlockIndexer.h"
+#include "model/GgufFile.hpp"
 #include "model/Qwen4Exp.hpp"
 #include "model/RuntimeArenas.hpp"
 #include "model/SparseRowStore.hpp"
@@ -10,7 +11,11 @@
 #include "ops/NgramEmbedding.hpp"
 #include "ops/PageStorage.hpp"
 
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <variant>
 
@@ -64,6 +69,18 @@ void addStreamCapture(metal::CommandGraph &graph, const QwenTargetGeometry &geom
                                       {destinationRow, capturedWidth, slot * width}, hyperShape(geometry), rows);
 }
 
+// The layers SPLASH_CVEC_LAYERS names ("first-last"), or all of them.
+std::pair<uint32_t, uint32_t> projectedLayers(uint32_t layers) {
+  const char *range = std::getenv("SPLASH_CVEC_LAYERS");
+  if (!range) return {0, layers - 1};
+  const char *dash = std::strchr(range, '-');
+  if (!dash) throw std::invalid_argument("SPLASH_CVEC_LAYERS is first-last");
+  const uint32_t first = static_cast<uint32_t>(std::stoul(std::string(range, dash))),
+                 last = static_cast<uint32_t>(std::stoul(dash + 1));
+  if (first > last || last >= layers) throw std::invalid_argument("SPLASH_CVEC_LAYERS past the model's layers");
+  return {first, last};
+}
+
 } // namespace
 
 Qwen4ExpTarget::Qwen4ExpTarget(const Qwen4ExpWeights &weights, const QwenTargetGeometry &geometry,
@@ -72,6 +89,36 @@ Qwen4ExpTarget::Qwen4ExpTarget(const Qwen4ExpWeights &weights, const QwenTargetG
     : QwenTarget(weights, geometry, backend, operators), weights_(weights),
       steps_(weights, geometry_, backend, prefillChunks) {
   requireLayers(std::span<const Qwen4ExpLayerWeights>(weights.layers));
+  projections_.resize(geometry_.layers);
+  const char *path = std::getenv("SPLASH_CVEC");
+  if (!path) return;
+  const OpenGguf gguf({std::filesystem::path(path)});
+  const GgufFile &file = gguf.file();
+  if (file.metadata().architecture() != "controlvector")
+    throw std::invalid_argument("SPLASH_CVEC is not a controlvector GGUF");
+  const uint32_t hidden = geometry_.hiddenSize;
+  const uint64_t bytes = uint64_t{hidden} * sizeof(float);
+  const auto [first, last] = projectedLayers(geometry_.layers);
+  directions_ = backend.allocateBuffer(geometry_.layers * bytes, metal::BufferStorage::Shared, "qwen4-cvec");
+  uint32_t count = 0;
+  for (uint32_t layer = first; layer <= last; ++layer) {
+    const GgufTensor *tensor = file.find("direction." + std::to_string(layer));
+    if (!tensor) continue;
+    if (tensor->type != ggml::kF32 || tensor->elements() != hidden)
+      throw std::invalid_argument("a SPLASH_CVEC direction is not F32 of the hidden size");
+    projections_[layer] = backend.view(directions_, layer * bytes, bytes);
+    file.source(tensor->file).readData(tensor->offset,
+                                       {static_cast<uint8_t *>(projections_[layer].contents()), bytes});
+    ++count;
+  }
+  std::cerr << "splash: projecting out " << count << " control-vector directions of " << path << " after layers "
+            << first << "-" << last << '\n';
+}
+
+void Qwen4ExpTarget::addProjection(metal::CommandGraph &graph, metal::MetalBuffer streams, uint32_t index,
+                                   uint32_t rows) const {
+  if (projections_[index])
+    ops::HyperConnection::addProject(graph, std::move(streams), projections_[index], hyperShape(geometry_), rows);
 }
 
 QwenTargetScratchBytes Qwen4ExpTarget::allocatedScratchBytes() const noexcept { return steps_.allocatedBytes(); }
@@ -173,6 +220,7 @@ void Qwen4ExpTarget::addPrefillExperts(PrefillStep &step, uint32_t index) const 
   const Qwen4Scratch &h = step.scratch;
   ops::MoE::addRouted(step.graph, step.ffn, weights_.layers[index].ffn, *step.moe);
   ops::HyperConnection::addCombine(step.graph, h.streams, h.branch, h.weights, hyperShape(geometry_), step.rows);
+  addProjection(step.graph, h.streams, index, step.rows);
   forEachPrefillCapture(step, index, [&](uint32_t slot, uint32_t source, uint32_t destination, uint32_t rows) {
     addStreamCapture(step.graph, geometry_, slot, rowsOf<float>(h.streams, source, rows, geometry_.streamWidth()),
                      step.buffers.captured, destination, rows);
@@ -371,6 +419,7 @@ void Qwen4ExpTarget::addVerify(metal::CommandGraph &graph, QwenTargetVerifyBuffe
     addVerifyMix(step, layer.ffnHyper, b.normalized);
     ops::MoE::add(step.graph, {b.normalized, h.zeros, h.branch, b.moe, b.verifyRows}, layer.ffn, *step.moe);
     ops::HyperConnection::addCombine(step.graph, h.streams, h.branch, h.weights, hs, rows);
+    addProjection(step.graph, h.streams, index, rows);
     if (const auto slot = geometry_.captureSlot(index))
       addStreamCapture(step.graph, geometry_, *slot, h.streams, b.capturedTargetHidden, 0, rows);
   }

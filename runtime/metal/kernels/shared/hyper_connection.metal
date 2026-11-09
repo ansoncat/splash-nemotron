@@ -258,6 +258,26 @@ kernel void hyper_connection_combine(device float *streams [[buffer(0)]],
   for (uint s = 0; s < p.streams; ++s) x[s * p.hidden] += b * weights[row * p.streams + s];
 }
 
+// Each stream minus its component along the unit `direction` (fp32
+// [hidden]): a control vector's projection after a block, h -= (h . d) d.
+kernel void hyper_connection_project(device float *streams [[buffer(0)]],
+                                     device const float *direction [[buffer(1)]],
+                                     constant HyperConnectionParams &p [[buffer(2)]],
+                                     uint row [[threadgroup_position_in_grid]],
+                                     uint tid [[thread_index_in_threadgroup]],
+                                     uint lane [[thread_index_in_simdgroup]],
+                                     uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float scratch[kSimdgroups * kStreams];
+  if (row >= p.rows) return;
+  device float *x = streams + ulong(row) * p.streams * p.hidden;
+  float dots[kStreams] = {};
+  for (uint d = tid; d < p.hidden; d += kRowThreads)
+    for (uint s = 0; s < p.streams; ++s) dots[s] += x[s * p.hidden + d] * direction[d];
+  reduce_streams(dots, p.streams, scratch, lane, sg);
+  for (uint d = tid; d < p.hidden; d += kRowThreads)
+    for (uint s = 0; s < p.streams; ++s) x[s * p.hidden + d] -= dots[s] * direction[d];
+}
+
 // The streams' start: every stream a copy of the token's embedding.
 kernel void hyper_connection_init(device const bfloat *embedding [[buffer(0)]],
                                   device float *streams [[buffer(1)]],
