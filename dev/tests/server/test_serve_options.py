@@ -116,6 +116,19 @@ OPTIONS = {
         {"auto": None, "AUTO": None, "1200M": 1200 * 1024**2},
         ("0", "off", "bad", "-2G"),
     ),
+    "--control-vector": values(
+        "--control-vector",
+        {
+            "/models/cvec.gguf": "/models/cvec.gguf",
+            "~/cvec.gguf": os.path.expanduser("~/cvec.gguf"),
+        },
+        ("", " "),
+    ),
+    "--control-vector-layers": values(
+        "--control-vector-layers",
+        {"4-44": "4-44", "04-44": "4-44", "0-0": "0-0"},
+        ("44-4", "4", "-4", "a-b", "4-44-5"),
+    ),
     "--host-reserve": values(
         "--host-reserve",
         {"auto": None, "0": 0, "2G": 2 * 1024**3, "512M": 512 * 1024**2},

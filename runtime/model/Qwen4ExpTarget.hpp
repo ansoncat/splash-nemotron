@@ -26,7 +26,7 @@ class Qwen4ExpTarget final : public QwenTarget {
 public:
   // A target whose prefill commands run up to `prefillChunks` chunks.
   Qwen4ExpTarget(const Qwen4ExpWeights &weights, const QwenTargetGeometry &geometry, metal::MetalBackend &backend,
-                 const ops::ExecutionPlans &operators, uint32_t prefillChunks);
+                 const ops::ExecutionPlans &operators, uint32_t prefillChunks, const ControlVector &controlVector);
 
   [[nodiscard]] QwenTargetScratchBytes allocatedScratchBytes() const noexcept override;
   [[nodiscard]] std::vector<metal::MetalBuffer> addPrefill(metal::CommandGraph &graph,
@@ -110,12 +110,16 @@ private:
   Qwen4Steps steps_;
   // Each layer's control-vector direction (fp32 [hidden], unit), projected
   // out of every stream after the layer; empty for a layer without one. Read
-  // from the controlvector GGUF SPLASH_CVEC names, its direction.N after
-  // layer N, for the N of SPLASH_CVEC_LAYERS ("first-last", inclusive;
-  // every direction it holds without it). No SPLASH_CVEC, none.
+  // from the controlvector GGUF ControlVector::path names, its direction.N
+  // after layer N, for the N in [first, last]. No path, none.
   metal::MetalBuffer directions_;
   std::vector<metal::MetalBuffer> projections_;
-  void addProjection(metal::CommandGraph &graph, metal::MetalBuffer streams, uint32_t index, uint32_t rows) const;
+  // Whether each verify lane's request takes them (prepareVerifyLane); a
+  // prefill's sequences say so themselves (QwenTargetRequest::controlVector).
+  std::array<bool, ExecutionLimits::maximumBatchWidth> projectedLanes_{};
+  // Layer `index`'s direction out of the (first row, rows) spans of `streams`.
+  void addProjection(metal::CommandGraph &graph, const metal::MetalBuffer &streams, uint32_t index,
+                     std::span<const std::pair<uint32_t, uint32_t>> spans) const;
 };
 
 } // namespace splash::model

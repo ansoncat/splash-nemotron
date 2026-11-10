@@ -189,6 +189,20 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "auto" && value != "all")
         throw UsageError("--verify-rows requires auto or all");
       result.verifyRows = value == "all" ? model::VerifyRows::All : model::VerifyRows::Auto;
+    } else if (option == "--control-vector") {
+      if (value.empty())
+        throw UsageError("--control-vector requires a file");
+      result.controlVector.path = std::filesystem::absolute(std::filesystem::path(value));
+    } else if (option == "--control-vector-layers") {
+      const size_t dash = value.find('-');
+      uint32_t &first = result.controlVector.first, &last = result.controlVector.last;
+      const auto read = [](std::string_view text, uint32_t &out) {
+        return !text.empty() && std::from_chars(text.data(), text.data() + text.size(), out).ptr ==
+                                    text.data() + text.size();
+      };
+      if (dash == std::string_view::npos || !read(value.substr(0, dash), first) ||
+          !read(value.substr(dash + 1), last) || first > last)
+        throw UsageError("--control-vector-layers requires FIRST-LAST");
     } else if (option == "--relaunch-context") {
       relaunchContext = value;
     } else {
@@ -201,6 +215,8 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
     throw UsageError("--max-cache-disk-writes requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");
   if (!result.cacheRoot.empty() && !result.persistentCache)
     throw UsageError("--cache-dir requires --persistent-cache on");
+  if (result.controlVector.path.empty() && result.controlVector != model::ControlVector{})
+    throw UsageError("--control-vector-layers requires --control-vector");
   result.modelRoot = requireModelRoot(argv[2]);
   model::ModelDescriptor inspected = inspectModel(result.modelRoot);
   result.maxContext = parseMaxContext(argv[3]);

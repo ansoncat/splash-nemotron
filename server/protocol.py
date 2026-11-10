@@ -202,11 +202,15 @@ class RequestFlag(IntFlag):
     IGNORE_END_OF_SEQUENCE = 1 << 0
     # Report the prompt's progress while it prefills (PromptProgressEvent).
     RETURN_PROGRESS = 1 << 1
+    # Leave the engine's --control-vector out of the request's rows.
+    SKIP_CONTROL_VECTOR = 1 << 2
 
 
 # A request with any other bit set is a request error.
 _REQUEST_FLAG_BITS = int(
-    RequestFlag.IGNORE_END_OF_SEQUENCE | RequestFlag.RETURN_PROGRESS
+    RequestFlag.IGNORE_END_OF_SEQUENCE
+    | RequestFlag.RETURN_PROGRESS
+    | RequestFlag.SKIP_CONTROL_VECTOR
 )
 
 

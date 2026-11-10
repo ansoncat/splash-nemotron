@@ -2142,8 +2142,10 @@ counters include:
 
 ## Native protocol
 
-The engine receives `ignore_eos` as bit 0 of the request frame's flags word and
-`return_progress` as bit 1; the word rejects undefined bits.
+The engine receives `ignore_eos` as bit 0 of the request frame's flags word,
+`return_progress` as bit 1 and `"control_vector": false` as bit 2, which leaves
+the `--control-vector` projection out of the request's prefill rows and verify
+lane; the word rejects undefined bits.
 
 A request that generates in a thinking block may carry a thinking budget: its
 tokens, the end tokens the engine selects where it runs out, the last of which

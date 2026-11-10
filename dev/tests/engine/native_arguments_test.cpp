@@ -191,6 +191,8 @@ void testServerCommandLines(const char *path) {
       {"sparse_kv_memory", [](NativeArguments &read) { read.sparseKvMemory = 1200 * (kGiB >> 10); }},
       {"host_reserve", [](NativeArguments &read) { read.hostSpareReserve = 2 * kGiB; }},
       {"host_reserve_zero", [](NativeArguments &read) { read.hostSpareReserve = 0; }},
+      {"control_vector", [](NativeArguments &read) { read.controlVector = {"/models/cvec.gguf"}; }},
+      {"control_vector_layers", [](NativeArguments &read) { read.controlVector = {"/models/cvec.gguf", 4, 44}; }},
   };
   // Every field but the model inspected from the directory, whose RoPE
   // scaling MAX_CONTEXT sets.
@@ -212,7 +214,7 @@ void testServerCommandLines(const char *path) {
            read.expertMemory == meant.expertMemory && read.sparseKvMemory == meant.sparseKvMemory &&
            read.hostSpareReserve == meant.hostSpareReserve &&
            read.kvSpillAlways == meant.kvSpillAlways && read.kvWindowTrim == meant.kvWindowTrim &&
-           read.verifyRows == meant.verifyRows;
+           read.verifyRows == meant.verifyRows && read.controlVector == meant.controlVector;
   };
   const auto golden = readGolden(path);
   require(golden.size() == changes.size(),
@@ -298,6 +300,11 @@ void testRefusals() {
   refuses({"auto", "auto", "--idle-sleep", "never"},
           "--idle-sleep requires prevent or allow");
   refuses({"auto", "auto", "--ane", "gpu"}, "--ane requires on or off");
+  refuses({"auto", "auto", "--control-vector", ""}, "--control-vector requires a file");
+  for (const char *layers : {"44-4", "4", "-44", "4-", "a-b", "4-44x"})
+    refuses({"auto", "auto", "--control-vector", "/m.gguf", "--control-vector-layers", layers},
+            "--control-vector-layers requires FIRST-LAST");
+  refuses({"auto", "auto", "--control-vector-layers", "4-44"}, "--control-vector-layers requires --control-vector");
   for (const char *rows : {"budget", "every", "ALL", ""})
     refuses({"auto", "auto", "--verify-rows", rows}, "--verify-rows requires auto or all");
   // The server passes bytes, auto or off.

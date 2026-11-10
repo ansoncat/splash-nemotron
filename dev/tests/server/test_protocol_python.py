@@ -838,7 +838,7 @@ class ProtocolPythonTests(unittest.TestCase):
         # scoring decides the output, fails the request.
         cases = [
             (replace(request, flags=flags), p.IssueCode.INVALID_ENUM_VALUE)
-            for flags in (1 << 2, 1 << 31, 0xFFFFFFFF, True, -1, 1 << 32, 1.0)
+            for flags in (1 << 3, 1 << 31, 0xFFFFFFFF, True, -1, 1 << 32, 1.0)
         ] + [
             (
                 replace(base, flags=p.RequestFlag.IGNORE_END_OF_SEQUENCE),

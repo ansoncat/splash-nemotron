@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -54,9 +55,24 @@ enum RequestFlag : uint32_t {
   // Never select the model's stop tokens, so generation runs to its output
   // limit. Only unconstrained generation can carry it.
   RequestIgnoreEndOfSequence = 1U << 0,
+  // Leave the target's control vector (ControlVector) out of the request's
+  // rows. Bit 1 is the frame's own (engine::kReturnProgressFlag).
+  RequestSkipControlVector = 1U << 2,
 };
 
-inline constexpr uint32_t kRequestFlagBits = RequestIgnoreEndOfSequence;
+inline constexpr uint32_t kRequestFlagBits = RequestIgnoreEndOfSequence | RequestSkipControlVector;
+
+namespace model {
+// --control-vector: the controlvector GGUF whose direction.N a Flash-Next
+// target projects out of its residual streams after layer N, for the N in
+// [first, last]; an empty path, none.
+struct ControlVector final {
+  std::filesystem::path path;
+  uint32_t first = 0;
+  uint32_t last = std::numeric_limits<uint32_t>::max();
+  bool operator==(const ControlVector &) const = default;
+};
+} // namespace model
 
 // A request's token selection, its fields in the native request frame's
 // order. The defaults are greedy selection with nothing changing the logits.

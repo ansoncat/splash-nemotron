@@ -101,6 +101,8 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--mmproj` | None | A local GGUF target's vision projector; requires `--model-dir`. |
 | `--revision` | Default branch | Select an upstream target branch, tag, or commit. See [revisions](#revisions). |
 | `--draft-model` | The family's released DFlash2 draft | A compatible repository or local directory in its place. See [drafts](models.md#drafts). |
+| `--control-vector` | None | Qwen3.8-Flash-Next: a llama.cpp controlvector GGUF whose `direction.N`, a unit vector, is projected out of every residual stream after layer N, for each request that does not send `"control_vector": false` ([API](api.md#control-vector)). The engine logs how many directions it loaded. |
+| `--control-vector-layers` | Every direction | The layers `--control-vector` projects after, `FIRST-LAST`, e.g. `4-44`; needs `--control-vector`. |
 | `--language-only` | Off | Skip vision loading; image and PDF input is rejected. See [vision](models.md#vision). |
 | `--offline` | Off | Start the installed model without asking the Hub, as `HF_HUB_OFFLINE=1` does. See [revisions](#revisions). |
 | `--port` | `SPLASH_PORT` or `8000` | HTTP port. |

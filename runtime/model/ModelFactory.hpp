@@ -135,6 +135,7 @@ struct RuntimeContext final {
   KvBlockCache *blockCache = nullptr;
   KvHistoryStream *historyStream = nullptr;
   VerifyRows verifyRows = VerifyRows::Auto;
+  ControlVector controlVector{};
 };
 
 // Validates only the interface between independently defined target and draft

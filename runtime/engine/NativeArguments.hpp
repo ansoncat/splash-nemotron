@@ -90,6 +90,9 @@ struct NativeArguments final {
   // --verify-rows auto|all: the rows of the draft's block a decode
   // cycle verifies (RuntimeResourcesConfig::verifyRows).
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  // --control-vector PATH and --control-vector-layers FIRST-LAST
+  // (RuntimeResourcesConfig::controlVector).
+  model::ControlVector controlVector;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto

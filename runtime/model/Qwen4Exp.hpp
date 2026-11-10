@@ -185,12 +185,13 @@ struct Qwen4ExpWeights final : QwenTargetWeightsBase {
 // up to `prefillChunks` chunks; the step scratch it keeps itself, with the
 // rows of a streamed PLE table of `tableRowBytes` each (zero: the table
 // loads); and the projections its hyper-connection mixes, QSA indexers and
-// PLE layer dispatch (qwenTargetGeometry).
+// PLE layer dispatch (qwenTargetGeometry). It projects `controlVector` out
+// of the rows of the requests that take it (Qwen4ExpTarget::projections_).
 [[nodiscard]] std::unique_ptr<QwenTarget> makeQwenTarget(const Qwen4ExpWeights &weights,
                                                          const QwenTargetGeometry &geometry,
                                                          metal::MetalBackend &backend,
                                                          const ops::ExecutionPlans &operators,
-                                                         uint32_t prefillChunks);
+                                                         uint32_t prefillChunks, const ControlVector &controlVector);
 [[nodiscard]] QwenTargetScratchBytes qwenTargetScratchBytes(const Qwen4ExpWeights &weights,
                                                             const QwenTargetGeometry &geometry,
                                                             uint32_t prefillChunks, uint64_t tableRowBytes);

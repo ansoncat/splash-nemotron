@@ -3,6 +3,7 @@ handler; each API's handlers, request conversion and answers live in its
 module in dialects/."""
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -1206,6 +1207,20 @@ class ListenError(Exception):
     """The HTTP server cannot listen at its address."""
 
 
+def _control_vector_key(args):
+    """What keys the cache salt of requests that take --control-vector
+    (Frontend._projected_salt): the file's bytes and the layers it projects
+    after, so that another vector, or the same one after other layers, never
+    shares their cache, even across restarts. None without one."""
+    if args.control_vector is None:
+        return None
+    hasher = hashlib.blake2b(digest_size=32)
+    with open(args.control_vector, "rb") as file:
+        hasher.update(file.read())
+    hasher.update((args.control_vector_layers or "all").encode())
+    return hasher.digest()
+
+
 def _start_failed(args, error, failure):
     """End a start that failed, saying why in the log and, for the app, in
     the launcher's serve record (serve_record)."""
@@ -1344,6 +1359,7 @@ def main():
             announce_served_name=args.announce_served_name,
             default_reasoning_effort=args.default_reasoning_effort,
             default_thinking_token_budget=args.thinking_token_budget,
+            control_vector_key=_control_vector_key(args),
         )
         server.app = app
         server.server_activate()

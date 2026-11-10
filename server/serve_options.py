@@ -203,6 +203,21 @@ def parse_host_reserve(value):
         ) from None
 
 
+def parse_control_vector(value):
+    """A controlvector GGUF's path, absolute; the engine reads it."""
+    if not value.strip():
+        raise argparse.ArgumentTypeError("must name a file")
+    return os.path.abspath(os.path.expanduser(value))
+
+
+def parse_control_vector_layers(value):
+    """FIRST-LAST, layer numbers with FIRST at most LAST."""
+    first, dash, last = value.strip().partition("-")
+    if not (dash and first.isdecimal() and last.isdecimal()) or int(first) > int(last):
+        raise argparse.ArgumentTypeError("use FIRST-LAST, e.g. 4-44")
+    return f"{int(first)}-{int(last)}"
+
+
 def parse_cache_dir(value):
     if not value.strip():
         raise argparse.ArgumentTypeError("must name a directory")
@@ -877,6 +892,32 @@ SERVE_OPTIONS = (
             "stays awake until they finish; the display may still sleep)",
         ),
         engine=EngineArgument("--idle-sleep", text=_spelled("allow")),
+    ),
+    # This fork's: a Qwen3.8-Flash-Next model only, which the engine checks.
+    ServeOption(
+        "--control-vector",
+        "model",
+        dict(
+            type=parse_control_vector,
+            default=None,
+            metavar="GGUF",
+            help="a llama.cpp controlvector GGUF whose direction.N is projected "
+            "out of the residual streams after layer N, for every request that "
+            "does not send control_vector: false (Qwen3.8-Flash-Next only)",
+        ),
+        engine=EngineArgument("--control-vector"),
+    ),
+    ServeOption(
+        "--control-vector-layers",
+        "model",
+        dict(
+            type=parse_control_vector_layers,
+            default=None,
+            metavar="FIRST-LAST",
+            help="the layers whose directions --control-vector projects out, "
+            "e.g. 4-44 (default: every direction the file holds)",
+        ),
+        engine=EngineArgument("--control-vector-layers"),
     ),
 )
 

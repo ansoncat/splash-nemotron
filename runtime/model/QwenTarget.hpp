@@ -219,10 +219,12 @@ struct QwenTargetStateCapture final {
 // the runtime has them, tokens[p] the token at position p (a prefill's, its
 // prompt), and the RoPE position (t, h, w) of each of its positions. Only a
 // target that makes inputs of its own of a step's tokens reads them
-// (Qwen3.8-Flash-Next: its PLE n-grams and QSA blocks).
+// (Qwen3.8-Flash-Next: its PLE n-grams and QSA blocks). controlVector: its
+// rows take the target's control vector, if it has one (RequestSkipControlVector).
 struct QwenTargetRequest final {
   std::span<const uint32_t> tokens;
   std::function<std::array<uint32_t, 3>(uint64_t)> rotary;
+  bool controlVector = true;
 };
 
 // A lane's rows of a prefill chunk: `tokens`, of positions from

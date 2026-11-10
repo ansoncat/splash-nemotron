@@ -608,8 +608,14 @@ struct Runtime::Impl {
         sampling(geometry.target.vocabularySize),
         targetModel(std::visit(
                         [&](const auto &weights) {
-                          return makeQwenTarget(weights, geometry.target, value.backend, operators,
-                                                geometry.prefillChunks);
+                          if constexpr (std::is_same_v<std::remove_cvref_t<decltype(weights)>, Qwen4ExpWeights>)
+                            return makeQwenTarget(weights, geometry.target, value.backend, operators,
+                                                  geometry.prefillChunks, value.controlVector);
+                          else if (!value.controlVector.path.empty())
+                            throw std::invalid_argument("--control-vector needs a Qwen3.8-Flash-Next target");
+                          else
+                            return makeQwenTarget(weights, geometry.target, value.backend, operators,
+                                                  geometry.prefillChunks);
                         },
                         value.model.target)),
         aneFfn(value.aneFfn), blockCache(value.blockCache), historyStream(value.historyStream),
@@ -1754,7 +1760,8 @@ struct Runtime::Impl {
   // A request as the target reads it beyond a step's rows: its tokens, a
   // prefill's its prompt, and their RoPE positions.
   static QwenTargetRequest targetRequest(const Request &entry) {
-    return {entry.tokens, [&entry](uint64_t logical) { return ropePosition(entry, logical); }};
+    return {entry.tokens, [&entry](uint64_t logical) { return ropePosition(entry, logical); },
+            !(entry.flags & RequestSkipControlVector)};
   }
 
   // The states a sequence of `rows` rows captures inside them, in their

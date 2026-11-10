@@ -44,3 +44,5 @@ expert_memory_auto | --expert-memory auto --ple-memory auto | auto auto
 sparse_kv_memory | --sparse-kv-memory 1200M | auto auto --sparse-kv-memory 1258291200
 host_reserve | --host-reserve 2G | auto auto --host-reserve 2147483648
 host_reserve_zero | --host-reserve 0 | auto auto --host-reserve 0
+control_vector | --control-vector /models/cvec.gguf | auto auto --control-vector /models/cvec.gguf
+control_vector_layers | --control-vector /models/cvec.gguf --control-vector-layers 4-44 | auto auto --control-vector /models/cvec.gguf --control-vector-layers 4-44

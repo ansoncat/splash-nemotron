@@ -894,6 +894,8 @@ def main_args(**overrides):
             "expert_memory": None,
             "sparse_kv_memory": None,
             "host_reserve": None,
+            "control_vector": None,
+            "control_vector_layers": None,
             "kv_format": "int8",
             "state_format": "fp32",
             "serve_record": None,

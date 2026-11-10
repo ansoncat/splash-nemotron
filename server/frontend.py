@@ -167,6 +167,8 @@ class GenerationOptions:
     # The thinking tokens of a request that thinks, after which its thinking
     # closes; None for no cap.
     thinking_token_budget: int | None
+    # Whether its rows take the engine's --control-vector.
+    control_vector: bool = False
 
 
 class Frontend:
@@ -192,6 +194,7 @@ class Frontend:
         default_reasoning_effort=None,
         default_thinking_token_budget=None,
         sampling_defaults=None,
+        control_vector_key=None,
     ):
         # What the engine serves, from its Ready (backend.runtime.capabilities):
         # the context follows the latest engine (max_context); its lanes and
@@ -237,6 +240,9 @@ class Frontend:
         ):
             raise ValueError("invalid default_thinking_token_budget")
         self.default_thinking_token_budget = default_thinking_token_budget
+        # The engine's --control-vector as control_vector_key gives it; None
+        # without one.
+        self.control_vector_key = control_vector_key
         # The served family's published sampling, by field: what a request
         # gets for each of these it leaves out. Each is a value a request may
         # send, so a request that leaves it out is never refused for it.
@@ -729,8 +735,23 @@ class Frontend:
             priority=priority,
             score_tokens=tuple(slot_ids),
             public_id=secrets.token_hex(16),
-            cache_salt=cache_salt,
+            cache_salt=self._projected_salt(cache_salt),
         )
+
+    def _projected_salt(self, salt):
+        """The cache salt of a request whose rows take the engine's control
+        vector: its own, keyed by the vector, so that its prompts share cache
+        only with requests that project the same directions; a request
+        without it keeps its own, whose cache is a stock engine's."""
+        if self.control_vector_key is None:
+            return salt
+        digest = hashlib.blake2b(
+            salt.to_bytes(16, "little"),
+            digest_size=16,
+            key=self.control_vector_key,
+            person=b"splash-cvec",
+        ).digest()
+        return int.from_bytes(digest, "little")
 
     def apply_template(self, body, *, deadline):
         add_generation_prompt = body.get("add_generation_prompt", True)
@@ -1145,14 +1166,24 @@ class Frontend:
             )
         elif budget == -1:
             budget = None
+        projected = self.control_vector_key is not None
+        control_vector = body.get("control_vector", projected)
+        if not isinstance(control_vector, bool):
+            raise APIError(400, "control_vector must be a boolean")
+        if control_vector and not projected:
+            raise APIError(
+                400, "control_vector needs a server started with --control-vector"
+            )
+        salt = request_fields.cache_salt(body)
         return GenerationOptions(
             wire.SamplingParameters(top_k=top_k, **numbers),
             stop_sequences,
             ignore_eos,
             seed,
             request_fields.priority(body),
-            request_fields.cache_salt(body),
+            self._projected_salt(salt) if control_vector else salt,
             budget,
+            control_vector,
         )
 
     def _output_budget(self, requested, prompt_tokens, field):
@@ -1175,6 +1206,8 @@ class Frontend:
         generation options set."""
         if options.ignore_eos:
             flags |= wire.RequestFlag.IGNORE_END_OF_SEQUENCE
+        if self.control_vector_key is not None and not options.control_vector:
+            flags |= wire.RequestFlag.SKIP_CONTROL_VECTOR
         return Job(
             request_id=next(self.ids),
             prompt_tokens=prompt_tokens,

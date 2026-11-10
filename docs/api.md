@@ -322,6 +322,16 @@ to generate a fixed number of tokens. Constrained tool calls, output under
 `tool_choice: "none"` and structured output generate under a grammar, which
 decides where the output ends, so combining them with `ignore_eos` returns 400.
 
+### Control vector
+
+Every generation API accepts `"control_vector"`, a boolean. On a server started
+with `--control-vector` ([server options](server.md#server-options)) it
+defaults to true, and `false` serves the request as the model without the vector
+does. Without `--control-vector` it defaults to false and `true` returns 400.
+A request's cached prompts are shared only with requests that project the same
+vector after the same layers, or with none of them; one that sends `false`
+shares a server's cache without the vector.
+
 Streaming requests accept `"return_progress":true` (default false). Before output,
 `prompt_progress` reports `{total, cache, processed, time_ms}`: prompt tokens,
 initial cached tokens, completed tokens including cache, and elapsed milliseconds
