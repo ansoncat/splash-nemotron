@@ -10,6 +10,8 @@
 > NVIDIA Nemotron 3.5 Bolt (74B-A9B) and Nemotron 3.5 Super VL (120B-A12B), with
 > NVIDIA's LiLiCorr drafts, RADIO vision, and SSD expert streaming for both
 > ([Nemotron 3.5](#nemotron-35-this-fork)), and video input for both.
+> It can also project a control vector out of Qwen3.8-Flash-Next
+> ([control vector](#qwen38-flash-next-control-vector-this-fork)).
 > Everything else is upstream. 中文說明：[README.zh-TW.md](README.zh-TW.md).
 >
 > - `nemotron` (this default branch): all of the fork's changes, merged with
@@ -25,6 +27,8 @@
 >   - `super-vl`: Nemotron 3.5 Super VL, and NVFP4G64 for its official NVFP4 GGUF.
 >   - `nemotron-video`: video input with NVIDIA's EVS pruning.
 >     `nemotron` is this branch plus this README.
+>   - The Flash-Next control vector is only on `nemotron`; it isn't meant for
+>     upstream.
 >
 > The desktop app and Homebrew formula below are upstream's and don't include
 > these changes. Install the fork's prebuilt
@@ -222,6 +226,29 @@ Not done yet:
   prompt shows a drop. Its other two settings make no difference: its output
   head is the target's rounded to NVFP4, and its ε of 1e-5 against the
   kernels' 1e-6 changes its norms by under one part in a million.
+
+### Qwen3.8-Flash-Next control vector (this fork)
+
+`--control-vector` takes a llama.cpp control-vector GGUF and projects its
+directions out of Flash-Next's residual streams, `h -= (h·d)d` after each
+layer, in prefill and verify alike. `--control-vector-layers FIRST-LAST`
+limits it to those layers; direction N applies after layer N, as in llama.cpp.
+
+```bash
+./splash serve --model ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0 \
+  --control-vector ~/models/cvec/china-v1.gguf --control-vector-layers 4-44
+```
+
+- Every request is projected; send `"control_vector": false` to leave it out
+  for one request ([API](docs/api.md#control-vector)). Projected and plain
+  requests batch together and keep separate prefix caches.
+- Other models refuse the option at startup.
+- With `china-v1.gguf` from `zjj1993/Qwen3.8-Flash-Next-uncensored-china`
+  on layers 4–44, measured here (Q2_0, same session, greedy): answers to
+  24 direct political questions stopped stating the official line (6 → 0)
+  and stopped refusing June 4th; HumanEval+ and BFCL simple and multiple
+  didn't drop, and BFCL parallel went from 38% to 52%. Names and framing
+  inside ordinary tasks didn't change.
 
 ## Settings
 
