@@ -611,6 +611,11 @@ class LauncherTests(unittest.TestCase):
             "--revision",
             "--draft-model",
             "--mmproj",
+            # This fork's video options, which its desktop app, upstream's,
+            # does not offer.
+            "--video-fps",
+            "--video-max-frames",
+            "--video-pruning",
         }
         self.assertIn("--max-memory", flags)
         table = Path(launcher.__file__).resolve().parents[1] / (

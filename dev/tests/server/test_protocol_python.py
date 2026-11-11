@@ -765,11 +765,11 @@ class ProtocolPythonTests(unittest.TestCase):
             1,
         )
         self.assertEqual(
-            struct.unpack_from("<IIIIQQ", wire, span_offset),
-            (1, 1, 2, 2, 0x1111222233334444, 0x5555666677778888),
+            struct.unpack_from("<IIIIQQIII", wire, span_offset),
+            (1, 1, 2, 2, 0x1111222233334444, 0x5555666677778888, 1, 1, 0),
         )
         # The thinking end tokens follow the pixels.
-        self.assertEqual(wire[span_offset + 32 : -8], image.image_pixels)
+        self.assertEqual(wire[span_offset + 44 : -8], image.image_pixels)
         self.assertEqual(decode_client(wire), image)
 
     def test_thinking_budget_follows_the_cache_salt(self):

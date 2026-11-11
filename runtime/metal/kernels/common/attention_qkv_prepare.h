@@ -11,8 +11,9 @@
 // table row of RotaryPairs pairs, the half split of the first 2 x RotaryPairs
 // dimensions: Qwen3.5's first 64, or with HeadDim / 2 pairs the whole head
 // (NeoX's). With no pairs (NoPE) the head is stored as normalized, and no
-// table is read.
-template <uint QHeads, uint KHeads, uint HeadDim, uint RotaryPairs, bool Gated, class W>
+// table is read. Without Normed (a geometry with no q/k norms, Nemotron-H's)
+// each head is stored as projected, and no norm is read.
+template <uint QHeads, uint KHeads, uint HeadDim, uint RotaryPairs, bool Gated, class W, bool Normed = true>
 inline void full_qkv_storage_phase(
     device const bfloat *qkv, device const W *q_norm,
     device const W *k_norm, device const float *rope_cos,
@@ -50,12 +51,16 @@ inline void full_qkv_storage_phase(
     destination = chunk_keys + key_offset;
   }
 
-  float element = float(source[thread_index]);
-  const float inverse = rms_inverse_of_sums<HeadDim / 32>(element * element, HeadDim,
-                                                          reductions, thread_index, lane,
-                                                          simd_group);
-  normalized[thread_index] =
-      bfloat(element * inverse * float(weight[thread_index]));
+  if (Normed) {
+    float element = float(source[thread_index]);
+    const float inverse = rms_inverse_of_sums<HeadDim / 32>(element * element, HeadDim,
+                                                            reductions, thread_index, lane,
+                                                            simd_group);
+    normalized[thread_index] =
+        bfloat(element * inverse * float(weight[thread_index]));
+  } else {
+    normalized[thread_index] = source[thread_index];
+  }
   if (!query) {
     ulong value_offset =
         (ulong(head_index) * HeadDim + thread_index) * params.stride +

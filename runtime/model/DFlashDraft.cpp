@@ -2,6 +2,7 @@
 #include "Checked.hpp"
 #include "DraftCheckpoint.hpp"
 #include "metal/abi/DraftAttention.h"
+#include "metal/abi/LiLiCorr.h"
 #include "ops/Embedding.hpp"
 
 #include <algorithm>
@@ -94,6 +95,7 @@ DFlashDraftRing::DFlashDraftRing(
     : tracker_(std::move(tracker)), layers_(layout.layers) {
   if (!tracker_)
     throw std::invalid_argument("draft state allocation tracker is empty");
+  if (!layout.ringBytes()) return; // No draft: an empty ring.
   const uint64_t before = backend.memoryStats().allocatedBytes;
   const metal::MetalBuffer base = backend.allocateBuffer(
       layout.ringBytes(), metal::BufferStorage::Shared, label);
@@ -103,6 +105,10 @@ DFlashDraftRing::DFlashDraftRing(
     cursor += layout.tensorBytes();
     layer.values = backend.view(base, cursor, layout.tensorBytes());
     cursor += layout.tensorBytes();
+  }
+  if (layout.anchorBytes()) {
+    layers_.front().anchor = backend.view(base, cursor, layout.anchorBytes());
+    cursor += layout.anchorBytes();
   }
   if (cursor != layout.ringBytes())
     throw std::logic_error("draft ring accounting mismatch");
@@ -123,6 +129,7 @@ DFlashContextWindow::DFlashContextWindow(
     : tracker_(std::move(tracker)) {
   if (!tracker_)
     throw std::invalid_argument("draft state allocation tracker is empty");
+  if (!layout.windowBytes()) return; // No draft: no window.
   const uint64_t before = backend.memoryStats().allocatedBytes;
   buffer_ = backend.allocateBuffer(layout.windowBytes(), metal::BufferStorage::Shared, label);
   actualAllocatedBytes_ =
@@ -141,12 +148,22 @@ DFlashDraft::DFlashDraft(const DFlashDraftWeights &weights,
                          const ops::ExecutionPlans &operators)
     : weights_(weights), backend_(backend), operators_(operators),
       selector_(weights.layout.vocabularySize),
-      contextKvProjections_(contextKvRows(backend, weights)) {}
+      contextKvProjections_(contextKvRows(backend, weights)) {
+  if (weights.lilicorr) allocateLiLiCorr();
+}
 
 void DFlashDraft::addSelection(
     metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
     std::span<const uint32_t> anchors,
-    std::span<const ops::SamplingPolicy> policies) const {
+    std::span<const ops::SamplingPolicy> policies, const metal::MetalBuffer &finalHidden,
+    const ops::EmbeddingWeights *tokenEmbedding, std::span<const metal::MetalBuffer> anchorRows) const {
+  if (weights_.lilicorr) {
+    if (!tokenEmbedding) throw std::invalid_argument("a LiLiCorr draft's selection reads the target's token table");
+    ops::LiLiCorr::add(graph, operators_.linear(), selector_, buffers, *weights_.lilicorr, *lilicorr_,
+                       {finalHidden, *tokenEmbedding, anchorRows}, anchors, policies, weights_.layout.hiddenSize,
+                       weights_.layout.vocabularySize);
+    return;
+  }
   selector_.add(graph, buffers,
                 {weights_.predecessorCodebook, weights_.successorCodebook},
                 anchors, policies);
@@ -174,8 +191,12 @@ void DFlashDraft::addContextPrefill(
                                         backend_.view(buffers.hidden, compactRow * rowBytes, count * rowBytes),
                                         window, count, startPosition, layout.hiddenSize);
   };
-  for (const DFlashPrefillSpan &span : spans)
+  for (const DFlashPrefillSpan &span : spans) {
     store(span.compactRow, span.rows, span.startPosition, span.window);
+    if (weights_.lilicorr)
+      ops::LiLiCorr::addStoreAnchor(graph, buffers.hidden, span.compactRow + span.rows - 1, {},
+                                    span.ring.front().anchor, layout.hiddenSize);
+  }
   // Only the window: a cached state keeps no rings.
   for (const DFlashWindowCapture &capture : windowCaptures)
     store(capture.compactRow, capture.rows, capture.startPosition, capture.window);
@@ -194,6 +215,8 @@ void DFlashDraft::addContextRebuild(metal::CommandGraph &graph,
     throw std::invalid_argument("invalid draft context rebuild");
   ops::DraftAttention::addWindowLoad(graph, window, buffers.hidden, rows, startPosition,
                                      layout.hiddenSize);
+  if (weights_.lilicorr)
+    ops::LiLiCorr::addStoreAnchor(graph, buffers.hidden, rows - 1, {}, ring.front().anchor, layout.hiddenSize);
   const DFlashPrefillSpan span{0, rows, startPosition, ring, window};
   addContextKv(graph, buffers, rows, {&span, 1});
 }
@@ -239,7 +262,7 @@ uint32_t DFlashDraft::decodeStorageLanes(uint32_t lanes) const {
                                      &layer.downProjection})
       include(*p);
   include(weights_.contextProjection);
-  include(weights_.selectorProjection);
+  if (!weights_.lilicorr) include(weights_.selectorProjection);
   for (const ops::Projection &p : contextKvProjections_) include(p);
   return storageRows / ExecutionLimits::draftQueryRows;
 }
@@ -290,7 +313,7 @@ void DFlashDraft::addDecode(
         graph,
         {buffers.attention, buffers.persistentKeys[layer],
          buffers.persistentValues[layer], buffers.queryKeys,
-         buffers.queryValues},
+         buffers.queryValues, weights.sinks},
         cacheLengths, attentionPlan);
     ops::DraftAttention::addReorder(graph, buffers.attention,
                                     buffers.proposalQkv, attentionPlan);
@@ -342,6 +365,8 @@ void DFlashDraft::addDecode(
   const ops::PreparedInput afterHead = target.add(
       graph, {.input = buffers.finalHidden, .output = buffers.logits, .scratch = scratch, .prepared = finalHidden},
       vocabularyProjection, headPlan);
+  // A LiLiCorr selector reads the final hidden rows themselves.
+  if (weights_.lilicorr) return;
   linear.add(graph,
              {.input = buffers.finalHidden, .output = buffers.selectorHidden, .scratch = scratch,
               .prepared = afterHead},
@@ -389,6 +414,114 @@ void DFlashDraft::addContextCommit(
         buffers.persistentValues[layer], buffers.retainedCounts,
         startPositions, layout.attentionShape());
   }
+  // A lane's anchor row is its last retained context row.
+  if (weights_.lilicorr) {
+    const uint64_t laneBytes = uint64_t{ExecutionLimits::targetVerifyRows} * layout.hiddenSize * sizeof(uint16_t);
+    for (uint32_t lane = 0; lane < lanes; ++lane)
+      ops::LiLiCorr::addStoreAnchor(graph, backend_.view(buffers.hidden, lane * laneBytes, laneBytes), 0,
+                                    backend_.view(buffers.retainedCounts, lane * sizeof(uint32_t), sizeof(uint32_t)),
+                                    buffers.anchors[lane], layout.hiddenSize);
+  }
+}
+
+namespace {
+
+// The linear scratch a LiLiCorr selector's projections share.
+ops::LinearScratchSize liLiCorrLinear(const ops::LiLiCorrWeights &weights, const ops::ExecutionPlans &operators) {
+  ops::LinearScratchSize size;
+  for (const ops::Projection *p : weights.projections())
+    size.include(operators.linear().prefillScratchSize(p->shape()));
+  return size;
+}
+
+} // namespace
+
+uint64_t DFlashDraft::liLiCorrBytes(const DFlashDraftWeights &weights, const ops::ExecutionPlans &operators) {
+  if (!weights.lilicorr) return 0;
+  uint64_t bytes = 0;
+  for (uint64_t size : ops::LiLiCorr::scratchBytes(weights.layout.hiddenSize)) bytes += alignUp(size);
+  const ops::LinearScratchSize linear = liLiCorrLinear(*weights.lilicorr, operators);
+  for (uint64_t size : {linear.input, linear.sums, linear.partials, linear.counters, linear.rotated})
+    bytes += alignUp(size);
+  return bytes;
+}
+
+uint64_t DFlashDraft::allocatedLiLiCorrBytes() const noexcept {
+  if (!lilicorr_) return 0;
+  const ops::LiLiCorrScratch &s = *lilicorr_;
+  uint64_t bytes = 0;
+  for (const metal::MetalBuffer *buffer :
+       {&s.lse, &s.ids, &s.features, &s.featureDown, &s.embedded, &s.token, &s.pass, &s.x, &s.normalized, &s.wide,
+        &s.attention, &s.projected, &s.mlp, &s.anchorInput, &s.anchorProjected, &s.anchorState, &s.anchorRows,
+        &s.anchorOut, &s.outHead, &s.inHead, &s.linear.input, &s.linear.sums, &s.linear.partials,
+        &s.linear.counters, &s.linear.rotated})
+    bytes += buffer->allocatedBytes();
+  return bytes;
+}
+
+void DFlashDraft::allocateLiLiCorr() {
+  const std::vector<uint64_t> bytes = ops::LiLiCorr::scratchBytes(weights_.layout.hiddenSize);
+  std::vector<metal::MetalBuffer> views;
+  for (uint64_t size : bytes)
+    views.push_back(backend_.allocateBuffer(alignUp(size), metal::BufferStorage::Shared, "lilicorr-scratch"));
+  const ops::LinearScratchSize size = liLiCorrLinear(*weights_.lilicorr, operators_);
+  const auto optional = [&](uint64_t bytes) {
+    return bytes ? backend_.allocateBuffer(alignUp(bytes), metal::BufferStorage::Shared, "lilicorr-linear")
+                 : metal::MetalBuffer{};
+  };
+  lilicorr_ = ops::LiLiCorrScratch{views[0],  views[1],  views[2],  views[3],  views[4],  views[5],  views[6],
+                                   views[7],  views[8],  views[9],  views[10], views[11], views[12], views[13],
+                                   views[14], views[15], views[16], views[17], views[18], views[19],
+                                   {optional(size.input), optional(size.sums), optional(size.partials),
+                                    optional(size.counters), optional(size.rotated)}};
+  // The plan charges these whole pages (liLiCorrBytes), which Metal must
+  // allocate no more than.
+  if (allocatedLiLiCorrBytes() != liLiCorrBytes(weights_, operators_))
+    throw std::logic_error("LiLiCorr's scratch is not the memory plan's");
+}
+
+// A LiLiCorr selector's sections of model.bin, in DraftCheckpoint.cpp's
+// order.
+static ops::LiLiCorrWeights readLiLiCorr(WeightFile &file, uint32_t hidden) {
+  constexpr uint32_t width = SPLASH_LILICORR_HIDDEN;
+  const auto table = [&](uint64_t values, std::string_view label) {
+    return file.section(values * kBFloat16Bytes, label);
+  };
+  ops::LiLiCorrWeights w;
+  const auto linear = [&](ops::Projection &projection, metal::MetalBuffer &bias, uint32_t rows, uint32_t columns,
+                          std::string_view label) {
+    projection = readBlockProjection(file, rows, columns, label);
+    bias = table(rows, label);
+  };
+  linear(w.tokenProjection, w.tokenBias, width, hidden, "lilicorr-token");
+  linear(w.passProjection, w.passBias, width, hidden, "lilicorr-pass");
+  linear(w.contextProjection, w.contextBias, width, hidden, "lilicorr-context");
+  w.featureNormWeight = table(SPLASH_LILICORR_FEATURES, "lilicorr-feature-norm");
+  w.featureNormBias = table(SPLASH_LILICORR_FEATURES, "lilicorr-feature-norm-bias");
+  w.featureUp = table(uint64_t{width} * SPLASH_LILICORR_FEATURES, "lilicorr-feature-up");
+  w.featureUpBias = table(width, "lilicorr-feature-up-bias");
+  linear(w.featureDown, w.featureDownBias, width, width, "lilicorr-feature-down");
+  w.slotEmbedding = table(uint64_t{SPLASH_DRAFT_PROPOSAL_TOKENS} * width, "lilicorr-slot-embedding");
+  w.rankEmbedding = table(uint64_t{SPLASH_LILICORR_CANDIDATES} * width, "lilicorr-rank-embedding");
+  w.attentionBias = table(uint64_t{SPLASH_LILICORR_HEADS} * SPLASH_LILICORR_NODES * SPLASH_LILICORR_NODES,
+                          "lilicorr-attention-bias");
+  for (uint32_t i = 0; i < SPLASH_LILICORR_LAYERS; ++i) {
+    ops::LiLiCorrLayerWeights layer;
+    layer.attentionNorm = readNorm(file, width, false, "lilicorr-attention-norm");
+    linear(layer.inProjection, layer.inBias, 3 * width, width, "lilicorr-in");
+    linear(layer.outProjection, layer.outBias, width, width, "lilicorr-out");
+    layer.mlpNorm = readNorm(file, width, false, "lilicorr-mlp-norm");
+    linear(layer.upProjection, layer.upBias, SPLASH_LILICORR_MLP, width, "lilicorr-up");
+    linear(layer.downProjection, layer.downBias, width, SPLASH_LILICORR_MLP, "lilicorr-down");
+    w.layers.push_back(std::move(layer));
+  }
+  w.outputNorm = readNorm(file, width, false, "lilicorr-output-norm");
+  w.anchorNorm = readNorm(file, width, false, "lilicorr-anchor-norm");
+  linear(w.factorProjection, w.factorBias, width, 3 * width, "lilicorr-factor");
+  linear(w.outHead, w.outHeadBias, width, width, "lilicorr-out-head");
+  linear(w.inHead, w.inHeadBias, width, width, "lilicorr-in-head");
+  linear(w.anchorOutHead, w.anchorOutHeadBias, width, width, "lilicorr-anchor-out-head");
+  return w;
 }
 
 // Reads a draft's images in their section order: each layer, then model.bin.
@@ -421,6 +554,9 @@ DFlashDraftWeights loadDFlashDraftWeights(metal::MetalBackend &backend,
         file, layout.qkvSize, layout.hiddenSize, "qkv");
     layer.queryNorm = file.section(headNormBytes, "query-norm");
     layer.keyNorm = file.section(headNormBytes, "key-norm");
+    if (layout.attentionSinks)
+      layer.sinks = file.section(uint64_t{layout.attentionSize / layout.attentionHeadDimension} * kBFloat16Bytes,
+                                 "attention-sinks");
     layer.outputProjection = readBlockProjection(
         file, layout.hiddenSize, layout.attentionSize,
         "attention-output");
@@ -447,19 +583,22 @@ DFlashDraftWeights loadDFlashDraftWeights(metal::MetalBackend &backend,
         "context-projection");
     result.hiddenNorm = readNorm(file, layout.hiddenSize, false, "hidden-norm");
     result.finalNorm = readNorm(file, layout.hiddenSize, false, "final-norm");
-    result.selectorProjection = readBlockProjection(
-        file, layout.selectorRank, layout.hiddenSize, "selector");
-    const uint64_t codebookBytes = checkedMultiply<WeightStoreError>(
-        checkedMultiply<WeightStoreError>(layout.vocabularySize,
-                                          layout.selectorRank,
-                                          "draft codebook elements"),
-        kBFloat16Bytes, "draft codebook bytes");
-    result.predecessorCodebook =
-        file.section(codebookBytes, "predecessor-codebook");
-    result.successorCodebook =
-        file.section(codebookBytes, "successor-codebook");
+    if (!layout.lilicorr) {
+      result.selectorProjection = readBlockProjection(
+          file, layout.selectorRank, layout.hiddenSize, "selector");
+      const uint64_t codebookBytes = checkedMultiply<WeightStoreError>(
+          checkedMultiply<WeightStoreError>(layout.vocabularySize,
+                                            layout.selectorRank,
+                                            "draft codebook elements"),
+          kBFloat16Bytes, "draft codebook bytes");
+      result.predecessorCodebook =
+          file.section(codebookBytes, "predecessor-codebook");
+      result.successorCodebook =
+          file.section(codebookBytes, "successor-codebook");
+    }
     if (files.hasMaskEmbedding())
       result.maskEmbedding = file.section(uint64_t{layout.hiddenSize} * kBFloat16Bytes, "mask-embedding");
+    if (layout.lilicorr) result.lilicorr = readLiLiCorr(file, layout.hiddenSize);
     file.finish();
     result.files.push_back(file.record());
   }

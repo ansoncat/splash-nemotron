@@ -27,23 +27,23 @@ void copyExact(const MetalBuffer &destination, const MetalBuffer &source,
   if (destination.sizeBytes() != source.sizeBytes()) {
     throw std::logic_error(std::string(name) + " shape mismatch");
   }
-  if (destination)
-    std::memcpy(writableContents(destination, name),
-                writableContents(source, name), destination.sizeBytes());
+  if (!destination.sizeBytes()) return; // No buffer, or a model without a draft: no window.
+  std::memcpy(writableContents(destination, name),
+              writableContents(source, name), destination.sizeBytes());
 }
 
 void clear(const MetalBuffer &buffer, const char *name) {
-  if (buffer)
-    std::memset(writableContents(buffer, name), 0, buffer.sizeBytes());
+  if (!buffer.sizeBytes()) return;
+  std::memset(writableContents(buffer, name), 0, buffer.sizeBytes());
 }
 
 // What a state file slot holds of a state: its GDN cell, unless it has no
-// bytes, then its context window.
+// bytes, then its context window, which a model without a draft has none of.
 std::vector<std::span<std::byte>> stateSpans(const GdnParityBuffers &gdn,
                                              const MetalBuffer &window) {
   std::vector<std::span<std::byte>> spans;
   for (const MetalBuffer *buffer : {&gdn.stateBase, &window})
-    if (*buffer)
+    if (buffer->sizeBytes())
       spans.emplace_back(static_cast<std::byte *>(writableContents(*buffer, "state IO")),
                          buffer->sizeBytes());
   return spans;
@@ -355,6 +355,7 @@ void QwenStateStorage::clearDraftRings(uint32_t index) {
   for (const DFlashDraftRingLayer &layer : target.cells.draft->layers()) {
     clear(layer.keys, "draft ring keys");
     clear(layer.values, "draft ring values");
+    if (layer.anchor) clear(layer.anchor, "draft anchor");
   }
 }
 
@@ -542,6 +543,11 @@ QwenStateStorage::acquire(BufferCounts counts, std::string_view label, Buffers &
     if (!admission)
       return admission;
   }
+  // A model without a draft has a zero-byte window: nothing above allocates
+  // it where every cell is pooled.
+  if (!pooledWindow && !fresh.window)
+    fresh.window = std::shared_ptr<DFlashContextWindow>(new DFlashContextWindow(
+        backend_, allocations_, layout_.draft, std::string(label) + "-window"));
   for (uint32_t cell = 0; cell < pooledCells; ++cell) {
     buffers.gdn[cell] = std::move(pool_->cells.back());
     pool_->cells.pop_back();
