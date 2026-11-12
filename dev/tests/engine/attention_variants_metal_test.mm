@@ -983,12 +983,13 @@ int main(int argc, char **argv) {
       require(refused.empty(), "a refused projection encoded a dispatch");
     }
     checkGather(backend);
-    for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
-      checkPrefill(backend, format, kWhole, 0, 300);
-      checkPrefill(backend, format, kWhole, 300, 517, {129});
-      checkPrefill(backend, format, kWhole, 4103, 2048, {509});
-      checkVerify(backend, format, kWhole, std::vector<uint32_t>{0, 31, 1000, 2047});
-      checkVerify(backend, format, kWhole, std::vector<uint32_t>{0, 505, 4097, 10000});
+    for (const auto &[format, int8Queries] : {std::pair{kv::Format::Int8, false}, std::pair{kv::Format::Int8, true},
+                                              std::pair{kv::Format::BFloat16, false}}) {
+      checkPrefill(backend, format, int8Queries, kWhole, 0, 300);
+      checkPrefill(backend, format, int8Queries, kWhole, 300, 517, {129});
+      checkPrefill(backend, format, int8Queries, kWhole, 4103, 2048, {509});
+      checkVerify(backend, format, int8Queries, kWhole, std::vector<uint32_t>{0, 31, 1000, 2047});
+      checkVerify(backend, format, int8Queries, kWhole, std::vector<uint32_t>{0, 505, 4097, 10000});
     }
     std::cout << "attention variants: PASS\n";
   } catch (const std::exception &error) {
