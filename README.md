@@ -6,42 +6,6 @@
 
 **A local inference engine for Apple silicon, built around the model.**
 
-> **This is a fork of [incoai/splash](https://github.com/incoai/splash).** It adds
-> NVIDIA Nemotron 3.5 Bolt (74B-A9B) and Nemotron 3.5 Super VL (120B-A12B), with
-> NVIDIA's LiLiCorr drafts, RADIO vision, and SSD expert streaming for both
-> ([Nemotron 3.5](#nemotron-35-this-fork)), and video input for both.
-> Everything else is upstream. 中文說明：[README.zh-TW.md](README.zh-TW.md).
->
-> - `nemotron` (this default branch): all of the fork's changes, on upstream's
->   `main` of October 31 (after 1.5.0). Upstream's 1.6.0 is not merged yet.
-> - `main`: tracks upstream unchanged.
-> - Other branches each stack on the one before, for changes that may be
->   proposed upstream:
->   - `nemotron-3.5-bolt`: Bolt with its LiLiCorr draft and RADIO vision, as
->     proposed in [incoai/splash#633](https://github.com/incoai/splash/issues/633).
->   - `bolt-streaming`: streams Nemotron-H's routed experts from the SSD.
->   - `bench-tight-memory`: `backend-benchmark` warm-up under a tight `--max-memory`.
->   - `super-vl`: Nemotron 3.5 Super VL, and NVFP4G64 for its official NVFP4 GGUF.
->   - `nemotron-video`: video input with NVIDIA's EVS pruning.
->     `nemotron` is this branch plus this README.
->
-> The desktop app and Homebrew formula below are upstream's and don't include
-> these changes. Build this branch from source instead. It needs macOS 26.4 or
-> later, Xcode 26 or newer with its Metal Toolchain, and Python 3.12–3.14
-> ([build requirements](docs/README.md)):
->
-> ```bash
-> git clone -b nemotron https://github.com/ansoncat/splash-nemotron.git
-> cd splash-nemotron
-> make -j4
-> ./splash serve --model nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF
-> ```
->
-> The first serve sets up Python dependencies and downloads the model and its
-> draft. Run `./splash` from this checkout wherever upstream's docs say `splash`.
-> If `make` reports a missing Metal Toolchain, install it with
-> `xcodebuild -downloadComponent MetalToolchain`.
-
 Splash runs coding agents and OpenAI or Anthropic compatible applications on
 one Mac. It combines [DFlash 2](https://inco.ai/blog/dflash2/) speculative
 decoding, specialized Metal kernels, and automatic memory planning, with
@@ -143,73 +107,6 @@ reported by the API. Omit `--draft-model` to use the family's draft from the
 Hub cache, or add `--mmproj /models/mmproj-BF16.gguf` for a GGUF's vision.
 See [local model files](docs/models.md#local-model-files) for details.
 
-### Nemotron 3.5 (this fork)
-
-Bolt's draft is NVIDIA's `NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr-GGUF`,
-picked automatically. NVIDIA ships it only as a GGUF, so the installer converts
-it once into a BF16 DFlash2 checkpoint.
-
-```bash
-./splash serve --model nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF
-```
-
-Super has no automatic draft. Download the target, ggml-org's LiLiCorr draft
-and unsloth's mmproj with the [Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/guides/cli)
-(about 54 GB), then serve them as local files:
-
-```bash
-hf download unsloth/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF \
-  --include 'UD-IQ2_XXS/*' --include mmproj-BF16.gguf --local-dir ~/models/super
-hf download ggml-org/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF \
-  lilicorr-NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4.gguf --local-dir ~/models/super/lilicorr
-./splash serve --model local/Super \
-  --model-dir ~/models/super/UD-IQ2_XXS/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-UD-IQ2_XXS-00001-of-00003.gguf \
-  --draft-model ~/models/super/lilicorr --mmproj ~/models/super/mmproj-BF16.gguf
-```
-
-The first serve prepares these files, converting the draft once; later starts
-reuse it.
-
-- When the experts don't fit, `--expert-memory auto` streams the routed experts
-  from the SSD, as for the other MoE families.
-- Super's official NVFP4 GGUF loads too: its routed down projection has
-  2,688-wide rows, which load as NVFP4G64
-  ([formats](docs/models.md#gguf-targets)).
-- Both models take video: a `video_url` or `input_video` part with a base64 MP4
-  or QuickTime data URL. Splash samples 1 frame per second, up to 128 frames
-  (`--video-fps`, `--video-max-frames`), and lays the frames out as NVIDIA's
-  processor does, two to a temporal patch, each pair labelled with its
-  timestamps. Like the processor, it prunes 70% of the video's tokens by
-  default (EVS, `--video-pruning`; `0` keeps them all), so a 2-minute video at
-  1 FPS costs about 6.2K tokens instead of 16.8K. Prompt token counts match the
-  processor's. Only the GOPs holding sampled frames are decoded: a
-  30–60-minute video took about 20 s here. A video may be up to 256 MiB and take up
-  to 120 s to decode; its base64 exceeds the default request size above about
-  96 MiB, so serve long videos with `--max-request-size 1G`.
-
-Limits outside this fork:
-
-- Use ggml-org's Super LiLiCorr, not unsloth's: unsloth's doesn't match the
-  official config (2 KV heads, no window, YaRN).
-- Expert streaming was measured on a 64 GB Mac under `--max-memory`, not yet on
-  a 32 GB one.
-
-Not done yet:
-
-- The Mamba-2 state is fp32 only; `--state-format bf16` is refused. A BF16 state
-  needs its own kernels and a check of its error over long conversations.
-- Video frames are decoded in software (the hardware decoder stalls while
-  Super holds most of memory), the track's rotation is ignored, and WebM is
-  refused. Neither model has an audio encoder.
-- The kernels cover these two models' shapes only, as for every family; other
-  Nemotron-H geometries are refused until they get their own variants.
-- Super's draft states its own window of 8,192 tokens; it sees the engine's
-  2,048-token draft context, a compile-time size of every draft kernel. Its
-  acceptance at 33K tokens matches short prompts', so the window stays until a
-  prompt shows a drop. Its other two settings make no difference: its output
-  head is the target's rounded to NVFP4, and its ε of 1e-5 against the
-  kernels' 1e-6 changes its norms by under one part in a million.
-
 ## Settings
 
 Memory and context are sized automatically, up to the model's native context
@@ -282,55 +179,6 @@ That is **2.5–3.2×** as fast on the 35B and **4.5–5.3×** on the 27B
 
 Splash uses BF16 KV and `--disable-ane` in this comparison.
 [Benchmark details](docs/performance.md#gguf-against-llamacpp)
-
-### Nemotron 3.5 on this fork
-
-Measured by the fork's maintainer on an M5 Pro (20-core GPU, 64 GB): greedy,
-thinking off, prefix cache off, runs of each engine interleaved in one session.
-These are not upstream's numbers.
-
-Bolt against llama.cpp (b11681 with its DFlash draft), decode speed in tok/s:
-
-| Prompt | llama.cpp | **Splash** | Ratio |
-| --- | ---: | ---: | ---: |
-| Code | 45–46 | **115–120** | 2.5–2.6× |
-| English prose | 34–40 | **62–68** | 1.6–2.0× |
-| Traditional Chinese prose | 30–32 | **49–55** | 1.6–1.9× |
-| 33K-token document, explained | 30 | **61** | 2.1× |
-
-Time to first token is 1.6× as fast at 2K, 5K and 33K tokens. llama.cpp runs a
-copy of the official GGUF with the Mamba tensors in Q8_0, since its Metal
-backend doesn't run them in NVFP4; Splash runs the official GGUF.
-
-- **Bolt with streamed experts**, `--max-memory 20G`: about 0.7× the resident
-  decode speed, with logits bit-identical to resident. This was simulated on the
-  64 GB Mac and hasn't been run on a 32 GB one.
-- **Super VL**, UD-IQ2_XXS: all experts resident on 64 GB, 147K-token automatic
-  context, decode 0.54–0.75× Bolt's.
-
-| Model | GGUF | Experts on 64 GB | Decode |
-| --- | --- | --- | --- |
-| Bolt | NVIDIA NVFP4 (24 GB) | resident | baseline |
-| Bolt | unsloth UD-IQ2_XXS | resident | 0.94–1.19× |
-| Super VL | unsloth UD-IQ2_XXS (47.6 GiB) | resident | baseline |
-| Super VL | unsloth UD-IQ3_XXS (55.7 GiB) | 78% resident, streamed | 0.56–0.70× |
-| Super VL | ggml-org NVFP4 (71.6 GiB) | 47% resident, streamed | 0.16–0.29× |
-
-On HumanEval+, BFCL and a Traditional Chinese check, the measured quantizations
-of each model showed no clear quality difference (Super's NVFP4 wasn't
-measured). The maintainer runs Bolt's NVFP4 and Super's UD-IQ2_XXS.
-
-Video, Bolt at 1 FPS and up to 128 frames, greedy, EVS pruning off (`0`)
-against the default `0.7`:
-
-| Set | Thinking | Questions | Pruning 0 | Pruning 0.7 | Prompt tokens |
-| --- | --- | ---: | ---: | ---: | --- |
-| MVBench, 3 tasks (3–20 s clips) | off | 600 | 58.0% | 57.7% | −57% |
-| Video-MME long (30–60 min) | on | 102 | 41.2% | 45.1% | −61% |
-
-Neither difference is significant (McNemar p 0.89 and 0.45). On Video-MME,
-a third of the answers ran out of their 16,384 tokens while thinking and count
-as wrong, and only videos up to 256 MiB were used.
 
 ## Design
 
