@@ -152,7 +152,7 @@ QwenTargetGeometry qwenTargetGeometry(const NemotronHWeights &weights, std::span
           }
         },
         layer.block);
-  geometry.moeFormats = ops::moeFormats(moeBlocks);
+  geometry.moeRouterFormat = ops::moeRouterFormat(moeBlocks);
   geometry.prefillProjections = geometry.decodeProjections;
   geometry.include(weights.logitsProjection);
   for (auto *shapes : {&geometry.prefillProjections, &geometry.decodeProjections}) {

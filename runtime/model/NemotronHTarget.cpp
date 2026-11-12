@@ -259,7 +259,7 @@ void NemotronHTarget::addPrefillBlock(PrefillStep &step, const NemotronMoeWeight
   const PrefillScratch &s = prefillScratch_;
   addMoe({step.graph, step.rows, b.normalized, std::move(input), std::move(output), b.gdnOutput, {}, b.moe, s.latent,
           s.moeLatent, s.sharedMid},
-         block, operators_.moePrefill(block.shape, geometry_.moeFormats, step.rows),
+         block, operators_.moePrefill(block.shape, geometry_.moeRouterFormat, step.rows),
          PrefillProject{operators_.linear(), step.graph, step.rows, b.linearScratch});
 }
 
@@ -318,7 +318,7 @@ void NemotronHTarget::addBlock(VerifyStep &step, const NemotronMoeWeights &block
   const QwenTargetVerifyBuffers &b = step.buffers;
   addMoe({step.graph, step.rows, b.normalized, std::move(input), std::move(output), b.gdnOutput, b.verifyRows, b.moe,
           scratch_.latent, scratch_.moeLatent, scratch_.sharedMid},
-         block, operators_.moeDecode(block.shape, geometry_.moeFormats, step.lanes),
+         block, operators_.moeDecode(block.shape, geometry_.moeRouterFormat, step.lanes),
          [&](const ops::Projection &projection, metal::MetalBuffer in, metal::MetalBuffer out,
              metal::MetalBuffer residual) { addProjection(step, projection, std::move(in), std::move(out), std::move(residual)); });
 }

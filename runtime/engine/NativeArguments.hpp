@@ -93,6 +93,10 @@ struct NativeArguments final {
   // --control-vector PATH and --control-vector-layers FIRST-LAST
   // (RuntimeResourcesConfig::controlVector).
   model::ControlVector controlVector;
+  // --activations auto|bf16: whether activations may round to int8 where
+  // an int8-activation path takes them
+  // (RuntimeResourcesConfig::int8Activations).
+  ops::Int8Activations int8Activations = ops::Int8Activations::On;
 };
 
 // Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto
