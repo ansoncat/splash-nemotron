@@ -168,8 +168,7 @@ struct ComputeDispatch {
 // A host step's round trip on the host clock (AwakeClock, the time base of
 // the GPU's command buffer times): from the GPU end of the work before the
 // step to the runner taking it up, its work, and from its return to the GPU
-// start of the work after it. An inline step's pickup is 0: its buffer ends
-// after it, and the GPU raises its flag at no time the backend learns.
+// start of the work after it.
 struct HostStepTiming {
   double pickupSeconds = 0.0;
   double workSeconds = 0.0;
@@ -181,13 +180,6 @@ struct HostStepTiming {
 enum class HostStepGpu : uint8_t {
   Idle,
   Awake,
-  // Awake, with the spin at the end of the buffer before the step rather
-  // than in a buffer of its own, and the step taken up once the GPU raises
-  // a flag rather than once that buffer ended: the GPU first stores the
-  // step's `published` buffers back through the system scope, as only a
-  // buffer's end shows its stores to the CPU otherwise. The buffer after the
-  // step still waits for its event. Without the spin it runs as Awake does.
-  Inline,
 };
 
 // Orders a command against another agent, such as the Neural Engine, after
@@ -256,8 +248,6 @@ struct EventStep {
   std::function<void(const HostStepTiming &)> timed{};
   HostStepGpu gpu = HostStepGpu::Idle;
   std::function<void()> then{};
-  // The buffers the GPU wrote that `work` reads, for an Inline step.
-  std::vector<MetalBuffer> published{};
 };
 
 // What one submission encodes: its dispatches in order, and the event steps

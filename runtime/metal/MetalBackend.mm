@@ -180,9 +180,6 @@ constexpr uint32_t hostStepCheckLoads(std::chrono::milliseconds delay) noexcept 
 // release it saw and the loads it made before: a cache line past the counter
 // the CPU raises (word 0).
 constexpr NSUInteger kHostStepSeenOffset = 128;
-// Where in it host_step_ready raises an inline step's flag (HostStepGpu::Inline):
-// a cache line past the spin's.
-constexpr NSUInteger kHostStepFlagOffset = 256;
 // The library of host_step_wait, beside the backend's own: built apart, as
 // its compiler may refuse it (Makefile), and loaded only for awake steps.
 constexpr std::string_view kHostStepLibrary = "host-step.metallib";
@@ -196,7 +193,7 @@ NSUInteger addedBuffers(const EventStep &step) noexcept {
     switch (step.kind) {
     case EventStep::Kind::Signal: return 1;
     case EventStep::Kind::Wait: return 0;
-    case EventStep::Kind::Host: return step.gpu != HostStepGpu::Idle ? 2 : 1;
+    case EventStep::Kind::Host: return step.gpu == HostStepGpu::Awake ? 2 : 1;
     }
     return 0;
 }
@@ -212,7 +209,7 @@ NSUInteger checkEvents(std::span<const EventStep> events, size_t dispatches) {
             throw MetalBackendError(step.kind == EventStep::Kind::Host
                                         ? "host step needs work"
                                         : "event step needs an event and a nonzero value");
-        if (step.gpu != HostStepGpu::Idle && step.kind != EventStep::Kind::Host)
+        if (step.gpu == HostStepGpu::Awake && step.kind != EventStep::Kind::Host)
             throw MetalBackendError("only a host step keeps the GPU awake");
         if (step.before < before)
             throw MetalBackendError("event steps are out of dispatch order");
@@ -581,9 +578,6 @@ struct HostSteps {
         // The release counter's value past the step, when the GPU spins
         // through it.
         std::optional<uint32_t> release;
-        // Whether the runner takes the step up once the GPU raised the
-        // spin's flag to `release` (an inline step) rather than readyEvent.
-        bool flagged = false;
     };
     __strong id<MTLSharedEvent> readyEvent = nil, ranEvent = nil;
     std::shared_ptr<BackendAsyncState> backend;
@@ -706,7 +700,6 @@ public:
 
 private:
     static constexpr auto kHostStepSpin = std::chrono::milliseconds(5);
-    static constexpr auto kFlagPoll = std::chrono::microseconds(50);
     // How often a blocked runner looks whether it is stopping.
     static constexpr uint64_t kStopCheckMilliseconds = 10;
 
@@ -722,21 +715,6 @@ private:
             while (![event waitUntilSignaledValue:value timeoutMS:kStopCheckMilliseconds])
                 if (ended()) return false;
             return true;
-        }
-        return true;
-    }
-
-    // Whether the GPU raised an inline step's flag (kHostStepFlagOffset of
-    // `releases`) to `value` before the runner was stopped or the buffer
-    // before the step failed. No event wakes the runner: past kHostStepSpin
-    // it looks every kFlagPoll.
-    bool flagged(id<MTLBuffer> releases, uint32_t value, id<MTLCommandBuffer> before) const {
-        const auto *flag = reinterpret_cast<const std::atomic<uint32_t> *>(
-            static_cast<const uint8_t *>(releases.contents) + kHostStepFlagOffset);
-        const auto spinEnd = AwakeClock::now() + kHostStepSpin;
-        while (static_cast<int32_t>(flag->load(std::memory_order_acquire) - value) < 0) {
-            if (stopping_ || before.status == MTLCommandBufferStatusError) return false;
-            if (AwakeClock::now() >= spinEnd) std::this_thread::sleep_for(kFlagPoll);
         }
         return true;
     }
@@ -760,9 +738,7 @@ private:
                 std::optional<double> returned;
                 // A halted command's step still waits for the work before
                 // it, which the event's value then follows.
-                const bool ready = before &&
-                                   (step.flagged ? flagged(steps.releases, *step.release, before)
-                                                 : reached(steps.readyEvent, step.ready, before)) &&
+                const bool ready = before && reached(steps.readyEvent, step.ready, before) &&
                                    before.status != MTLCommandBufferStatusError;
                 if (ready && !steps.halted) {
                     const double pickup = awakeSeconds();
@@ -813,8 +789,6 @@ private:
 // where the spin writes the last release it saw (kHostStepSeenOffset).
 struct HostStepSpin {
     __strong id<MTLComputePipelineState> pipeline = nil;
-    // host_step_publish and host_step_ready, for inline steps.
-    __strong id<MTLComputePipelineState> publish = nil, ready = nil;
     __strong id<MTLBuffer> releases = nil;
     // The release value of the last spin encoded.
     uint32_t sequence = 0;
@@ -1442,16 +1416,9 @@ struct MetalBackend::Impl {
     // buffer's start makes what the CPU wrote visible (a wait inside a buffer
     // that the GPU reaches after the signal leaves stale lines). An awake step
     // spins only once the spin was seen to end at its release
-    // (checkHostStepSpin). An inline step (HostStepGpu::Inline) spins at the
-    // end of `command` itself, after it published what the step reads and
-    // raised its flag, which the runner takes it up from: the buffer after it
-    // starts in about half the time (M5 Pro: resume 52 against 97 us). It
-    // still waits for ranEvent, so a spin that ends at its bound only idles
-    // the GPU; a buffer's start is also what shows the step's writes to it,
-    // which the work after it reads stale within `command`.
+    // (checkHostStepSpin).
     template <class Fail>
-    id<MTLCommandBuffer> encodeHostStep(id<MTLCommandBuffer> command, __strong id<MTLComputeCommandEncoder> &encoder,
-                                        std::vector<id<MTLCommandBuffer>> &leading,
+    id<MTLCommandBuffer> encodeHostStep(id<MTLCommandBuffer> command, std::vector<id<MTLCommandBuffer>> &leading,
                                         std::shared_ptr<HostSteps> &steps, uint64_t sequence, const EventStep &step,
                                         Fail &&failEncoding) {
         if (!steps) {
@@ -1464,23 +1431,10 @@ struct MetalBackend::Impl {
             if (hostStepSpin) steps->releases = hostStepSpin->releases;
         }
         const uint64_t ready = steps->steps.size() + 1;
+        [command encodeSignalEvent:steps->readyEvent value:ready];
         id<MTLCommandBuffer> awake = nil;
         std::optional<uint32_t> released;
-        // An inline step's dispatches follow the work before it in its
-        // encoder, whose dispatches run one after another: in an encoder of
-        // its own, one that touches none of their buffers might start sooner.
-        const bool inlined = step.gpu == HostStepGpu::Inline && hostStepSpin && hostStepSpin->ready;
-        if (inlined) {
-            if (!encoder) encoder = [command computeCommandEncoder];
-            if (!encoder) failEncoding("unable to create Metal compute encoder");
-            released = encodeInline(*hostStepSpin, encoder, step.published);
-        }
-        if (encoder) {
-            [encoder endEncoding];
-            encoder = nil;
-        }
-        if (!inlined) [command encodeSignalEvent:steps->readyEvent value:ready];
-        if (step.gpu != HostStepGpu::Idle && !inlined && hostStepSpin) {
+        if (step.gpu == HostStepGpu::Awake && hostStepSpin) {
             awake = [queue commandBuffer];
             if (!awake) failEncoding("unable to create Metal command buffer");
             released = encodeSpin(*hostStepSpin, awake, kHostStepWaitLoads, failEncoding);
@@ -1488,7 +1442,7 @@ struct MetalBackend::Impl {
         id<MTLCommandBuffer> next = [queue commandBuffer];
         if (!next) failEncoding("unable to create Metal command buffer");
         [next encodeWaitForEvent:steps->ranEvent value:ready];
-        steps->steps.push_back({ready, step.work, step.timed, step.then, command, next, 0.0, 0.0, released, inlined});
+        steps->steps.push_back({ready, step.work, step.timed, step.then, command, next, 0.0, 0.0, released});
         // `leading` holds the buffers committed, nothing failing in between.
         for (id<MTLCommandBuffer> buffer : {command, awake}) {
             if (!buffer) continue;
@@ -1513,35 +1467,6 @@ struct MetalBackend::Impl {
         [encoder setBuffer:spin.releases offset:kHostStepSeenOffset atIndex:2];
         [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
         [encoder endEncoding];
-        return release[0];
-    }
-
-    // Encodes into `encoder` an inline step's publish of `published`
-    // (host_step_publish), its flag (host_step_ready) and its spin, and
-    // returns the spin's release value, which the flag is raised to.
-    static uint32_t encodeInline(HostStepSpin &spin, id<MTLComputeCommandEncoder> encoder,
-                                 std::span<const MetalBuffer> published) {
-        for (const MetalBuffer &data : published) {
-            const MetalBuffer::Impl &impl = *data.impl_;
-            const uint32_t words = static_cast<uint32_t>(impl.lengthBytes / sizeof(uint32_t));
-            if (!words) continue;
-            [encoder setComputePipelineState:spin.publish];
-            [encoder setBuffer:impl.allocation->buffer offset:impl.offsetBytes atIndex:0];
-            [encoder setBuffer:impl.allocation->buffer offset:impl.offsetBytes atIndex:1];
-            [encoder setBytes:&words length:sizeof(words) atIndex:2];
-            [encoder dispatchThreadgroups:MTLSizeMake(std::min<uint32_t>((words + 255) / 256, 64), 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        }
-        const uint32_t release[2] = {++spin.sequence, kHostStepWaitLoads};
-        [encoder setComputePipelineState:spin.ready];
-        [encoder setBuffer:spin.releases offset:kHostStepFlagOffset atIndex:0];
-        [encoder setBytes:release length:sizeof(uint32_t) atIndex:1];
-        [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
-        [encoder setComputePipelineState:spin.pipeline];
-        [encoder setBuffer:spin.releases offset:0 atIndex:0];
-        [encoder setBytes:release length:sizeof(release) atIndex:1];
-        [encoder setBuffer:spin.releases offset:kHostStepSeenOffset atIndex:2];
-        [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
         return release[0];
     }
 
@@ -1631,14 +1556,8 @@ struct MetalBackend::Impl {
     // the backend's, with a release buffer whose counter starts at zero.
     HostStepSpin newHostStepSpin() {
         HostStepSpin spin;
-        id<MTLLibrary> library = loadLibrary(device, hostStepLibraryPath);
-        spin.pipeline = newPipeline(library, "host_step_wait");
-        // A library without them runs inline steps as awake ones.
-        if ([library newFunctionWithName:@"host_step_publish"] && [library newFunctionWithName:@"host_step_ready"]) {
-            spin.publish = newPipeline(library, "host_step_publish");
-            spin.ready = newPipeline(library, "host_step_ready");
-        }
-        spin.releases = newBuffer(kHostStepFlagOffset + sizeof(uint32_t), BufferStorage::Shared,
+        spin.pipeline = newPipeline(loadLibrary(device, hostStepLibraryPath), "host_step_wait");
+        spin.releases = newBuffer(kHostStepSeenOffset + 2 * sizeof(uint32_t), BufferStorage::Shared,
                                   @"host-step releases");
         std::memset(spin.releases.contents, 0, spin.releases.length);
         return spin;
@@ -1653,7 +1572,7 @@ struct MetalBackend::Impl {
                          std::vector<std::shared_ptr<MetalAllocation>> retained,
                          CommandCompletion completion) {
         if (!hostStepSpin && AwakeClock::now() >= nextSpinCheck &&
-            std::ranges::any_of(events, [](const EventStep &step) { return step.gpu != HostStepGpu::Idle; }))
+            std::ranges::any_of(events, [](const EventStep &step) { return step.gpu == HostStepGpu::Awake; }))
             checkHostStepSpin();
         // The runner starts with the first command that has a host step,
         // before the submission: one that cannot start leaves nothing held.
@@ -1699,14 +1618,14 @@ struct MetalBackend::Impl {
                 auto step = events.begin();
                 const auto encodeSteps = [&](size_t encoded) {
                     for (; step != events.end() && step->before == encoded; ++step) {
-                        if (step->kind == EventStep::Kind::Host) {
-                            command = encodeHostStep(command, encoder, leading, ticketState->hostSteps,
-                                                     ticketState->sequence, *step, failEncoding);
-                            continue;
-                        }
                         if (encoder) {
                             [encoder endEncoding];
                             encoder = nil;
+                        }
+                        if (step->kind == EventStep::Kind::Host) {
+                            command = encodeHostStep(command, leading, ticketState->hostSteps,
+                                                     ticketState->sequence, *step, failEncoding);
+                            continue;
                         }
                         id<MTLSharedEvent> event =
                             (__bridge id<MTLSharedEvent>)step->event.nativeHandle();

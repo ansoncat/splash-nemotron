@@ -1868,10 +1868,10 @@ std::optional<bool> spinCheck(MetalBackend &backend, std::string_view test) {
 constexpr double kSpinningResumeSeconds = 0.01;
 constexpr double kIdleResumeSeconds = 0.05;
 
-// The longest resume of a command's plain, awake and inline host steps, and
-// whether the GPU spun through the awake and inline ones.
+// The longest resume of a command's plain and of its awake host steps, and
+// whether the GPU spun through the awake ones.
 struct HostStepResumes {
-    double plain = 0.0, awake = 0.0, inlined = 0.0;
+    double plain = 0.0, awake = 0.0;
     bool spins = false;
 };
 
@@ -1880,8 +1880,7 @@ struct HostStepResumes {
 // fifty of them (more command buffers than a queue holds by default) runs
 // them in order, keeping the GPU awake or not, and on the backend's runner,
 // never on the submitting thread; a GPU spin through an awake step sees the
-// CPU end it on this system (host_step.metal). An inline step sees what the
-// GPU wrote before it in the buffer that runs on, which it publishes.
+// CPU end it on this system (host_step.metal).
 // Once the command completed, before its wait returns, each step's round trip
 // reached its `timed`: its work as long as the step took, and pickup and
 // resume within a second. A step without work is refused. Returns the longest
@@ -1899,11 +1898,9 @@ HostStepResumes hostSteps(const std::string &metallibPath) {
     const std::optional<bool> spins = spinCheck(backend, "the awake host steps' resume");
     require(spins.value_or(true), "a GPU spin through an awake host step did not see the CPU end it");
     HostStepResumes resumes{.spins = spins.value_or(false)};
-    for (const HostStepGpu gpu : {HostStepGpu::Idle, HostStepGpu::Awake, HostStepGpu::Inline}) {
-        const std::string kind = gpu == HostStepGpu::Idle ? "plain" : gpu == HostStepGpu::Awake ? "awake" : "inline";
-        double &longest = gpu == HostStepGpu::Idle    ? resumes.plain
-                          : gpu == HostStepGpu::Awake ? resumes.awake
-                                                      : resumes.inlined;
+    for (const bool awake : {false, true}) {
+        const std::string kind = awake ? "awake" : "plain";
+        double &longest = awake ? resumes.awake : resumes.plain;
         *value = 0;
         std::vector<uint32_t> seen;
         std::atomic<bool> onSubmitter{false};
@@ -1924,7 +1921,7 @@ HostStepResumes hostSteps(const std::string &metallibPath) {
                                  std::lock_guard lock(timedMutex);
                                  timings.push_back({step, timing});
                              },
-                             gpu, {}, {buffer}});
+                             awake ? HostStepGpu::Awake : HostStepGpu::Idle});
         const Command command{dispatches, steps};
         const auto started = std::chrono::steady_clock::now();
         (void)backend.submitCommandAsync(command).wait();
@@ -1991,8 +1988,6 @@ void hostStepsResumePromptly(const std::string &metallibPath) {
     const double awakeBound = resumes.spins ? kSpinningResumeSeconds : kIdleResumeSeconds;
     require(resumes.awake < awakeBound,
             "awake host steps' GPU work resumed as late as " + std::to_string(resumes.awake) + " s");
-    require(resumes.inlined < awakeBound,
-            "inline host steps' GPU work resumed as late as " + std::to_string(resumes.inlined) + " s");
 }
 
 // The first command of a fresh backend may hold an awake host step: the

@@ -89,10 +89,9 @@ public:
   // whether the GPU spins through it, and `then` runs once the work after it
   // may go.
   void host(std::function<void()> work, std::function<void(const HostStepTiming &)> timed = {},
-            HostStepGpu gpu = HostStepGpu::Idle, std::function<void()> then = {},
-            std::vector<MetalBuffer> published = {}) {
+            HostStepGpu gpu = HostStepGpu::Idle, std::function<void()> then = {}) {
     events_.push_back({dispatches_.size(), {}, 0, EventStep::Kind::Host, std::move(work), std::move(timed), gpu,
-                       std::move(then), std::move(published)});
+                       std::move(then)});
   }
 
   [[nodiscard]] bool empty() const noexcept { return dispatches_.empty(); }
