@@ -2,7 +2,7 @@
 #include "metal/abi/LiLiCorr.h"
 
 // The LiLiCorr selector of Bolt's draft (metal/abi/LiLiCorr.h,
-// model/LiLiCorr.cpp): everything around its projections, which ops::Linear
+// ops/LiLiCorr.cpp): everything around its projections, which ops::Linear
 // runs. A lane's nodes are rows lane * 56 + position * 8 + rank of every
 // [rows][width] buffer; its residual rows are fp32, every projection's input
 // and output bf16, and each projection's bias is added where its output is
