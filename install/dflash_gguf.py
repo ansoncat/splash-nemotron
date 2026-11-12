@@ -18,7 +18,7 @@ import numpy as np
 from . import gguf
 from .models import ModelError
 
-# The engine's draft layout (runtime/metal/abi/Draft.h): eight KV heads, and
+# The engine's draft layout (runtime/metal/abi/DraftAttention.h): eight KV heads, and
 # the selector's rank and candidates, which a LiLiCorr draft's selector
 # replaces but its configuration still states.
 KV_HEADS = 8
