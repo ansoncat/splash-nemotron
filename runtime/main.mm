@@ -556,6 +556,10 @@ int extractVideoFrames(int argc, char **argv) {
       int64_t first = INT64_MAX;
       if (count && CMSampleBufferGetOutputSampleTimingInfoArray(sample, count, timing.data(), nullptr) == noErr)
         for (const CMSampleTimingInfo &info : timing) {
+          // An hour at 240 fps is 864,000; past that, refuse before the
+          // per-frame tables grow with an untrusted file.
+          if (times.size() == 1'000'000)
+            throw std::runtime_error("the video has too many frames");
           times.push_back(tick(info.presentationTimeStamp));
           holder.emplace(times.back(), sync.size());
           first = std::min(first, times.back());
@@ -604,7 +608,8 @@ int extractVideoFrames(int argc, char **argv) {
   // Decoded frames arrive in decode order; each sampled one waits here until
   // those before it in presentation order are written.
   struct Output {
-    std::map<int64_t, size_t> wanted; // presentation time -> output position
+    // Presentation time -> output positions: frames can share a time.
+    std::multimap<int64_t, size_t> wanted;
     std::map<size_t, std::vector<uint8_t>> pending;
     size_t next = 0;
     long width = 0, height = 0;
@@ -667,8 +672,8 @@ int extractVideoFrames(int argc, char **argv) {
           session, sample, 0, nullptr,
           ^(OSStatus status, VTDecodeInfoFlags, CVImageBufferRef image, CMTime time, CMTime) {
             const std::lock_guard guard(state->lock);
-            const auto wanted = state->wanted.find(tick(time));
-            if (wanted == state->wanted.end())
+            const auto [first, last] = state->wanted.equal_range(tick(time));
+            if (first == last)
               return;
             if (status != noErr || !image ||
                 static_cast<long>(CVPixelBufferGetWidth(image)) != state->width ||
@@ -687,7 +692,8 @@ int extractVideoFrames(int argc, char **argv) {
                 pixel[0] = bgra[2], pixel[1] = bgra[1], pixel[2] = bgra[0];
               }
             CVPixelBufferUnlockBaseAddress(image, kCVPixelBufferLock_ReadOnly);
-            state->pending.emplace(wanted->second, std::move(rgb));
+            for (auto wanted = first; wanted != last; ++wanted)
+              state->pending.emplace(wanted->second, rgb);
             for (auto ready = state->pending.find(state->next); ready != state->pending.end();
                  ready = state->pending.find(state->next)) {
               std::fwrite(ready->second.data(), 1, ready->second.size(), stdout);

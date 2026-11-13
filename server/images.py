@@ -8,8 +8,8 @@ resent in chat history.
 import base64
 import hashlib
 import io
-import math
 import json
+import math
 import struct
 import subprocess
 import tempfile
@@ -135,7 +135,7 @@ def nemotron_resize(height: int, width: int, max_pixels: int) -> tuple[int, int]
     if max(height, width) / min(height, width) > 200:
         raise ImageError("absolute aspect ratio must be smaller than 200")
     budget = min(max_patches(max_pixels), NEMOTRON_MAX_PATCHES)
-    # Upstream's own rounding, ties to even: a whole odd count of patches
+    # NVIDIA's processor's own rounding, ties to even: a whole odd count of patches
     # gains one.
     rows, cols = round(height / PATCH + 0.5), round(width / PATCH + 0.5)
     factor = min(math.sqrt(budget / (rows * cols)), 1.0)
@@ -309,7 +309,9 @@ def prepare_video(
         try:
             header = json.loads(process.stdout.readline(4096) or b"null")
             if not isinstance(header, dict):
-                raise ImageError("video could not be decoded; MP4 and QuickTime are supported")
+                raise ImageError(
+                    "video could not be decoded; MP4 and QuickTime are supported"
+                )
             width, height = header["width"], header["height"]
             indices, source_fps = header["indices"], header["fps"]
             if not (

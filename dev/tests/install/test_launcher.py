@@ -611,8 +611,7 @@ class LauncherTests(unittest.TestCase):
             "--revision",
             "--draft-model",
             "--mmproj",
-            # This fork's video options, which its desktop app, upstream's,
-            # does not offer.
+            # CLI-only video options, which the desktop app does not offer.
             "--video-fps",
             "--video-max-frames",
             "--video-pruning",

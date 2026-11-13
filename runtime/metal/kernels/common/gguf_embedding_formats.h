@@ -274,12 +274,11 @@ struct GgufEmbedMXFP4 {
     return float(kFP4Values[q]) * as_type<float>(e < 2 ? 0x00200000u << e : (e - 1) << 23);
   }
 };
-// The loader's nvfp4 block of W elements (256, or NVFP4G64's 64): uchar scales[W / 16] | float g | uchar
-// codes[W / 2], element l in nibble l % 2 of codes[l / 2] and its 16-group's E4M3 scale scales[l / 16]; value =
-// kFP4Values[code] (twice the E2M1 value) times the scale the projections' coefficient rounds once
-// (kernels/common/quant_formats.h), (e4m3 / 2^8) (128 g).
-template <uint W> struct GgufEmbedNVFP4Block {
-  enum : uint { Weights = W, Bytes = W / 16 + 4 + W / 2, Scales = 0, G = quant_nvfp4_g(W), Codes = G + 4 };
+// The loader's nvfp4 block: uchar scales[16] | float g | uchar codes[128], element l in nibble l % 2 of codes[l / 2]
+// and its 16-group's E4M3 scale scales[l / 16]; value = kFP4Values[code] (twice the E2M1 value) times the scale the
+// projections' coefficient rounds once (kernels/common/quant_formats.h), (e4m3 / 2^8) (128 g).
+struct GgufEmbedNVFP4 {
+  enum : uint { Weights = 256, Bytes = 148, Scales = 0, G = QUANT_NVFP4_G, Codes = QUANT_NVFP4_CODES };
   __attribute__((always_inline)) static float decode(device const uchar *block, uint dim) {
 #pragma clang fp reassociate(off)
     const uint l = dim % Weights;
@@ -289,8 +288,18 @@ template <uint W> struct GgufEmbedNVFP4Block {
     return float(kFP4Values[q]) * (float(quant_e4m3_pair(block[Scales + l / 16]).x) * (128.0f * g));
   }
 };
-using GgufEmbedNVFP4 = GgufEmbedNVFP4Block<256>;
-using GgufEmbedNVFP4G64 = GgufEmbedNVFP4Block<64>;
+// NVFP4G64's loader block, GgufEmbedNVFP4's of 64 elements: uchar scales[4] | float g | uchar codes[32].
+struct GgufEmbedNVFP4G64 {
+  enum : uint { Weights = 64, Bytes = 40, Scales = 0, G = quant_nvfp4_g(64), Codes = G + 4 };
+  __attribute__((always_inline)) static float decode(device const uchar *block, uint dim) {
+#pragma clang fp reassociate(off)
+    const uint l = dim % Weights;
+    const uchar q = (block[Codes + l / 2] >> (4 * (l % 2))) & 15;
+    const float g = as_type<float>(uint(block[G]) | uint(block[G + 1]) << 8 | uint(block[G + 2]) << 16 |
+                                   uint(block[G + 3]) << 24);
+    return float(kFP4Values[q]) * (float(quant_e4m3_pair(block[Scales + l / 16]).x) * (128.0f * g));
+  }
+};
 // The loader's fp8 block: float g | uchar values[256], E4M3 values; value = (e4m3 / 2^8) (256 g), as the projections'
 // coefficient scales it.
 struct GgufEmbedFP8 {
@@ -377,13 +386,14 @@ GGUF_EMBED_AFFINE(8)
   X(pq20, GgufEmbedPQ20) X(q20, GgufEmbedQ20) X(iq4nl, GgufEmbedIQ4NL) X(iq4xs, GgufEmbedIQ4XS)                    \
   X(iq3s, GgufEmbedIQ3S) X(iq3xxs, GgufEmbedIQ3XXS) X(iq2xxs, GgufEmbedIQ2XXS) X(iq2xs, GgufEmbedIQ2XS)            \
   X(iq2s, GgufEmbedIQ2S) X(iq1s, GgufEmbedIQ1S) X(iq1m, GgufEmbedIQ1M) X(mxfp4, GgufEmbedMXFP4)                    \
-  X(nvfp4, GgufEmbedNVFP4) X(nvf4g64, GgufEmbedNVFP4G64) X(fp8, GgufEmbedFP8)                                      \
+  X(nvfp4, GgufEmbedNVFP4) X(fp8, GgufEmbedFP8)                                                                   \
   X(af2g32, GgufEmbedAF2G32) X(af2g64, GgufEmbedAF2G64) X(af2g128, GgufEmbedAF2G128)                               \
   X(af3g32, GgufEmbedAF3G32) X(af3g64, GgufEmbedAF3G64) X(af3g128, GgufEmbedAF3G128)                               \
   X(af4g32, GgufEmbedAF4G32) X(af4g64, GgufEmbedAF4G64) X(af4g128, GgufEmbedAF4G128)                               \
   X(af5g32, GgufEmbedAF5G32) X(af5g64, GgufEmbedAF5G64) X(af5g128, GgufEmbedAF5G128)                               \
   X(af6g32, GgufEmbedAF6G32) X(af6g64, GgufEmbedAF6G64) X(af6g128, GgufEmbedAF6G128)                               \
-  X(af8g32, GgufEmbedAF8G32) X(af8g64, GgufEmbedAF8G64) X(af8g128, GgufEmbedAF8G128)
+  X(af8g32, GgufEmbedAF8G32) X(af8g64, GgufEmbedAF8G64) X(af8g128, GgufEmbedAF8G128)                               \
+  X(nvf4g64, GgufEmbedNVFP4G64)
 #define GGUF_EMBEDDING_FORMATS(X) GGUF_QUANTIZED_EMBEDDING_FORMATS(X) X(bf16, GgufEmbedBF16) X(f16, GgufEmbedF16)
 #define GGUF_EMBEDDING_ONE(f, F) +1
 static_assert(0 GGUF_EMBEDDING_FORMATS(GGUF_EMBEDDING_ONE) == GGUF_FMT_COUNT, "GGUF_EMBEDDING_FORMATS lists every format");

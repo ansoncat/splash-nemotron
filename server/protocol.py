@@ -16,7 +16,7 @@ from dataclasses import dataclass, fields
 from enum import IntEnum, IntFlag
 from typing import TypeAlias
 
-PROTOCOL_VERSION = 13
+PROTOCOL_VERSION = 14
 # A frame is its header, the magic, the protocol version, the frame type and
 # the payload length, then the payload.
 FRAME_HEADER_BYTES = 16
@@ -737,6 +737,7 @@ def _payload_length_issue(
 
 
 def _image_spans_check(request: RequestFrame, prompt_tokens: int) -> None:
+    pixels = _bytes(request.image_pixels, "image pixels")
     previous_end = 0
     pixel_bytes = 0
     for span in request.image_spans:
@@ -768,6 +769,14 @@ def _image_spans_check(request: RequestFrame, prompt_tokens: int) -> None:
                 raise ValueError(
                     "a pruned video keeps between one tubelet's rows and all of them"
                 )
+            cuts = pixel_bytes + span.pixel_bytes - 4 * tubelets
+            if cuts + 4 * tubelets > len(pixels):
+                raise ValueError("image pixels do not match the image grids")
+            text_cuts = struct.unpack_from(f"<{tubelets}I", pixels, cuts)
+            if list(text_cuts) != sorted(text_cuts) or text_cuts[-1] > text_tokens:
+                raise ValueError(
+                    "a pruned video's text cuts must be ordered within its text"
+                )
         elif tubelets != 1 or tokens != rows:
             raise ValueError("image span tokens must equal the merged grid size")
         if offset < previous_end or offset + tokens > prompt_tokens:
@@ -776,7 +785,7 @@ def _image_spans_check(request: RequestFrame, prompt_tokens: int) -> None:
             )
         previous_end = offset + tokens
         pixel_bytes += span.pixel_bytes
-    if len(_bytes(request.image_pixels, "image pixels")) != pixel_bytes:
+    if len(pixels) != pixel_bytes:
         raise ValueError("image pixels do not match the image grids")
 
 

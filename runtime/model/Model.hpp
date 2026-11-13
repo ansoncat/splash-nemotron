@@ -212,6 +212,20 @@ struct ImageSpan final {
   [[nodiscard]] uint64_t pixelBytes() const noexcept {
     return pruned() ? uint64_t{tubelets} * (grid().pixelBytes() + sizeof(uint32_t)) : grid().pixelBytes();
   }
+  // Folds into a block identity's two chains (engine::blockImageIdentity)
+  // what a video adds: its tubelet's frames, and a pruned video's layout. An
+  // image adds nothing; its identity is as before videos.
+  void foldVideoIdentity(uint64_t &lo, uint64_t &hi, auto mix) const noexcept {
+    if (frames != 1) {
+      lo = mix(lo, frames);
+      hi = mix(hi, ~uint64_t{frames});
+    }
+    if (pruned()) {
+      const uint64_t layout = (uint64_t{tubelets} << 32) | textTokens;
+      lo = mix(lo, layout);
+      hi = mix(hi, ~layout);
+    }
+  }
   bool operator==(const ImageSpan &) const = default;
 };
 

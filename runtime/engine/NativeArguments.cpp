@@ -93,8 +93,7 @@ std::filesystem::path requireModelRoot(std::string_view argument) {
       std::filesystem::canonical(std::filesystem::path(argument), error);
   if (error || !std::filesystem::is_directory(root, error))
     throw ModelRootError("MODEL_DIRECTORY must name an existing directory");
-  // A model without a draft (Nemotron-H) has no draft/; the descriptor
-  // refuses the families that need one.
+  // Nemotron-H has no draft/; the descriptor refuses a family that needs one.
   if (!std::filesystem::is_directory(root / "target", error))
     throw ModelRootError("MODEL_DIRECTORY must hold the model's target/ directory");
   return root;
