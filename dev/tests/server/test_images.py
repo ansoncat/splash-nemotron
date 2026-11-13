@@ -5,6 +5,7 @@ import io
 import json
 import random
 import struct
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -106,7 +107,7 @@ class NemotronResizeTest(unittest.TestCase):
     def test_serving_cap_bounds_the_budget_and_overrides_the_minimum(self):
         self.assertEqual(images.nemotron_resize(448, 448, 65_536), (256, 256))
         self.assertEqual(images.nemotron_resize(48, 48, 65_536), (64, 64))
-        # Upstream's minimum gives 26x40 patches here, over a budget of 1028.
+        # NVIDIA's processor's minimum gives 26x40 patches here, over a budget of 1028.
         self.assertEqual(images.nemotron_resize(16, 36, 1028 * 256), (416, 608))
 
     def test_sides_stay_merge_aligned_inside_the_budget(self):
@@ -516,7 +517,9 @@ class ImageRequestTest(HarnessTestCase):
 
         app.latencies = LatencyMetrics()
         app.backend = SimpleNamespace(
-            runtime=SimpleNamespace(capabilities=SimpleNamespace(max_context_tokens=1024))
+            runtime=SimpleNamespace(
+                capabilities=SimpleNamespace(max_context_tokens=1024)
+            )
         )
         image = {"type": "image_url", "image_url": {"url": "unused"}}
         messages = [
@@ -557,6 +560,8 @@ class ImageRequestTest(HarnessTestCase):
         for position in reversed(positions):
             expected[position : position + 1] = [image_open, *[pad] * 4, image_close]
         self.assertEqual(expanded, expected)
+        # The count a request is checked against includes each image's tags.
+        self.assertEqual(app._image_token_count(tokens, prepared), len(expected))
         self.assertEqual(
             [span.offset for span in spans],
             [position + 1 + 5 * i for i, position in enumerate(positions)],
@@ -569,6 +574,29 @@ class ImageRequestTest(HarnessTestCase):
         tokens, positions, _ = app._render_image_tokens(quoting, template)
         with self.assertRaisesRegex(api.APIError, "image count"):
             app._check_image_placeholders(tokens, prepared[:1], positions)
+
+    def test_images_resize_as_their_familys_processor_does(self):
+        image = SimpleNamespace(tokens=4, pixels=b"\x00")
+        for chat_format in (QWEN, NEMOTRON):
+            with self.subTest(resize=chat_format.image_resize):
+                app = object.__new__(request_frontend.Frontend)
+                app.chat_format = chat_format
+                app.max_image_pixels = 1 << 20
+                app.images = mock.Mock(request_batch=type("Batch", (list,), {}))
+                app.images.prepare.return_value = image
+                app._check_image_request_size = mock.Mock()
+                part = {"type": "image_url", "image_url": {"url": "unused"}}
+                with mock.patch.object(
+                    request_frontend.image_input, "decode_data_url", return_value=b""
+                ):
+                    prepared = app._prepare_images(
+                        [{"role": "user", "content": [part]}],
+                        deadline=time.monotonic() + 60,
+                    )
+                self.assertEqual(prepared, [image])
+                app.images.prepare.assert_called_once_with(
+                    b"", 1 << 20, chat_format.image_resize
+                )
 
     def test_nemotron_videos_widen_to_labeled_tubelets(self):
         """As Nemotron Omni's processor widens <video>: each tubelet's label,
@@ -601,7 +629,9 @@ class ImageRequestTest(HarnessTestCase):
 
         app.latencies = LatencyMetrics()
         app.backend = SimpleNamespace(
-            runtime=SimpleNamespace(capabilities=SimpleNamespace(max_context_tokens=4096))
+            runtime=SimpleNamespace(
+                capabilities=SimpleNamespace(max_context_tokens=4096)
+            )
         )
         video = {"type": "video_url", "video_url": {"url": "unused"}}
         image = {"type": "image_url", "image_url": {"url": "unused"}}
@@ -626,20 +656,28 @@ class ImageRequestTest(HarnessTestCase):
             f"{labels[0]}<image>\n{labels[1]}<image><image>What changed?", rendered
         )
         tubelet = SimpleNamespace(
-            tokens=4, grid_height=4, grid_width=4, digest_lo=1, digest_hi=0,
-            pixels=bytes(2), frames=2,
+            tokens=4,
+            grid_height=4,
+            grid_width=4,
+            digest_lo=1,
+            digest_hi=0,
+            pixels=bytes(2),
+            frames=2,
         )
         picture = SimpleNamespace(
-            tokens=4, grid_height=4, grid_width=4, digest_lo=2, digest_hi=0,
-            pixels=bytes(1), frames=1,
+            tokens=4,
+            grid_height=4,
+            grid_width=4,
+            digest_lo=2,
+            digest_hi=0,
+            pixels=bytes(1),
+            frames=1,
         )
         expanded, spans, _ = app._expand_image_pads(
             tokens, [tubelet, tubelet, picture], positions
         )
         self.assertEqual([span.frames for span in spans], [2, 2, 1])
-        self.assertEqual(
-            tokenizer.decode(expanded).count(f"{NEMOTRON.image_open}"), 3
-        )
+        self.assertEqual(tokenizer.decode(expanded).count(f"{NEMOTRON.image_open}"), 3)
         with self.assertRaisesRegex(api.APIError, "video count"):
             app._render_image_tokens(messages, template, [])
 
@@ -668,7 +706,13 @@ class ImageRequestTest(HarnessTestCase):
         )
         video, picture = folded
         self.assertEqual(
-            (video.offset, video.tokens, video.frames, video.tubelets, video.text_tokens),
+            (
+                video.offset,
+                video.tokens,
+                video.frames,
+                video.tubelets,
+                video.text_tokens,
+            ),
             (3, 8, 2, 2, 4),
         )
         self.assertEqual((picture.offset, picture.tokens, picture.tubelets), (14, 4, 1))
@@ -719,7 +763,9 @@ class ImageRequestTest(HarnessTestCase):
         if not binary.exists():
             self.skipTest("needs build/splash")
         clip = root / "dev/tests/fixtures/videos/open_gop_bframes.mp4"
-        output = subprocess.run([binary, "video-frames", clip, "1", "128"], capture_output=True, check=True).stdout
+        output = subprocess.run(
+            [binary, "video-frames", clip, "1", "128"], capture_output=True, check=True
+        ).stdout
         self.assertEqual(
             hashlib.sha256(output).hexdigest(),
             "cfcd36debd1f836fb013044d50050209cfe547c6cb8dcdb036f9e882d4977d15",

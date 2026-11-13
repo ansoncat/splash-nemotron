@@ -955,8 +955,8 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
     const std::string targetFormat = requireString(record, @"target_format", "target format");
     const std::string visionFormat = requireString(record, @"vision_format", "vision format");
     NSDictionary *config = readObject(root / "config.json", "upstream model config");
-    // Every family decodes with its DFlash2 draft, in draft/, but Nemotron-H,
-    // which has none (DFlashDraftLayout::present).
+    // A model decodes with its DFlash2 draft when it has one, in draft/
+    // (DFlashDraftLayout::present).
     const bool hasDraft = std::filesystem::exists(root / "draft");
     NSDictionary *draft = hasDraft ? readObject(root / "draft" / "config.json", "draft config") : nil;
     ModelDescriptor result = describeSourceModel(std::move(name), targetFormat, visionFormat, config, draft);

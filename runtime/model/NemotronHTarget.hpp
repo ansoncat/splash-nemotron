@@ -4,7 +4,7 @@
 // behind its own RMS norm (epsilon 1e-5), added to one residual. Its Mamba-2
 // state lives in the runtime's GDN state cells (GdnStateLayout of Mamba-2
 // geometry) and folds a step's retained rows from its tape as GDN's does; it
-// has no auxiliary state and no draft. Its blocks run through ops::Mamba2,
+// has no auxiliary state. Its blocks run through ops::Mamba2,
 // the Qwen families' attention mixers and ops::MoE, on the runtime's arena and
 // the target's own decode scratch (scratchBytes). A prefill runs layer by
 // layer as the Qwen families' does; its Mamba-2 blocks run each sequence's

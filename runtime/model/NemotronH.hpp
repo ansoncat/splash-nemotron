@@ -113,7 +113,7 @@ struct NemotronHLayout final : QwenHybridLayout {
                           .rotaryTheta = 10'000'000.0F,
                           // Every attention layer.
                           .unrotatedLayers = 0xFF,
-                          // <SPECIAL_990>, which no draft reads (it has none).
+                          // <SPECIAL_990>, the LiLiCorr draft's mask token.
                           .maskToken = 990,
                           // <|im_end|>, </s>.
                           .stopTokens = {11, 2},
@@ -241,8 +241,8 @@ struct SparseRowStoreOptions;
 // From a GGUF only (GgufTarget's NemotronHGguf plan).
 [[nodiscard]] NemotronHWeights loadNemotronHWeights(metal::MetalBackend &backend, const NemotronHLayout &layout,
                                                     const QwenTargetFiles &files);
-// The family's geometry: its blocks' projections and no draft captures (it
-// has no draft).
+// The family's geometry: its blocks' projections and the layers its draft
+// captures.
 [[nodiscard]] QwenTargetGeometry qwenTargetGeometry(const NemotronHWeights &weights,
                                                     std::span<const uint32_t> captureLayers);
 [[nodiscard]] std::unique_ptr<QwenTarget> makeQwenTarget(const NemotronHWeights &weights,
@@ -252,7 +252,7 @@ struct SparseRowStoreOptions;
                                                          uint32_t prefillChunks);
 [[nodiscard]] SparseRowStoreOptions streamedTableRows(const NemotronHLayout &layout);
 // The decode scratch its blocks need beyond the runtime's arena
-// (NemotronHTarget); no prefill scratch yet.
+// (NemotronHTarget) and its prefill scratch.
 [[nodiscard]] QwenTargetScratchBytes qwenTargetScratchBytes(const NemotronHWeights &weights,
                                                             const QwenTargetGeometry &geometry,
                                                             uint32_t prefillChunks, uint64_t tableRowBytes);

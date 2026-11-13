@@ -15,7 +15,13 @@ from unittest import mock
 import numpy as np
 
 from dev.tests.fixture_files import write_gguf
-from dev.tests.installer_fixtures import BOLT, CONFIGS, fixture, tensor_table, write_target
+from dev.tests.installer_fixtures import (
+    BOLT,
+    CONFIGS,
+    fixture,
+    tensor_table,
+    write_target,
+)
 from install import assembly, dflash_gguf, hub, models, upstream
 
 F32, F16, Q8_0, BF16, NVFP4 = 0, 1, 8, 30, 40
