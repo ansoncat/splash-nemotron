@@ -264,6 +264,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/Linear.cpp \
 	runtime/ops/LinearGguf.cpp \
 	runtime/ops/KernelSelection.cpp \
+	runtime/ops/Mamba2.cpp \
 	runtime/ops/MoE.cpp \
 	runtime/ops/Normalization.cpp \
 	runtime/ops/HyperConnection.cpp \
