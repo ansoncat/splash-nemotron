@@ -5,7 +5,9 @@
 // end, the short prefix before any wrap, aligned wraps, windows that fill
 // exactly one or several splits, and the last slot of the ring, so that tile
 // bounds, the window mask, empty splits and the empty-row softmax guard are
-// all exercised.
+// all exercised. A LiLiCorr draft's attention (Bolt) sees 1024 positions of
+// the same ring and adds each query head's sink logit to its softmax; its
+// cases run the same lengths.
 #include "LinearNumerics.hpp"
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
@@ -85,14 +87,17 @@ MetalBuffer randomBfloat(MetalBackend &backend, uint64_t count, Random &random,
   return buffer;
 }
 
-// Reference for one lane and kv head: every row attends to the ring window it
-// can see plus all eight current rows, exactly as the kernel's mask defines.
+// Reference for one lane and kv head: every row attends to the `visible`
+// positions it can see plus all eight current rows, exactly as the kernel's
+// mask defines, and with `sinks` (the head's four query heads' logits) to a
+// key of no value.
 void referenceRows(const uint16_t *queries, const uint16_t *keys,
                    const uint16_t *values, const uint16_t *queryKeys,
                    const uint16_t *queryValues, uint32_t cacheLength,
-                   std::vector<float> &output) {
+                   std::vector<float> &output, uint32_t visible = kWindow,
+                   const uint16_t *sinks = nullptr) {
   const uint32_t commonStart =
-      cacheLength >= kWindow - 1 ? cacheLength - (kWindow - 1) : 0;
+      cacheLength >= visible - 1 ? cacheLength - (visible - 1) : 0;
   const uint32_t oldCount = cacheLength - commonStart;
   std::vector<double> scores(oldCount + kRows);
   std::vector<double> accumulated(kHeadDim);
@@ -100,7 +105,7 @@ void referenceRows(const uint16_t *queries, const uint16_t *keys,
     const uint32_t proposal = row % kRows;
     const uint32_t queryPosition = cacheLength + proposal;
     const uint32_t rowStart =
-        queryPosition >= kWindow - 1 ? queryPosition - (kWindow - 1) : 0;
+        queryPosition >= visible - 1 ? queryPosition - (visible - 1) : 0;
     const uint32_t hiddenPrefix = rowStart - commonStart;
     const uint16_t *query = queries + uint64_t{row} * kHeadDim;
     double best = -INFINITY;
@@ -126,7 +131,9 @@ void referenceRows(const uint16_t *queries, const uint16_t *keys,
       scores[key] = score;
       best = std::max(best, score);
     }
-    double sum = 0.0;
+    const double sink = sinks ? bf16ToFloat(sinks[row / kRows]) : -INFINITY;
+    best = std::max(best, sink);
+    double sum = sinks ? std::exp(sink - best) : 0.0;
     std::fill(accumulated.begin(), accumulated.end(), 0.0);
     for (uint32_t key = 0; key < oldCount + kRows; ++key) {
       if (scores[key] == -INFINITY)
@@ -150,6 +157,15 @@ void referenceRows(const uint16_t *queries, const uint16_t *keys,
 void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
              const std::array<uint32_t, kLanes> &cacheLengths) {
   Random random(0x5eed0000ULL + cacheLengths[0]);
+  const bool lilicorr = shape.window != kWindow;
+  // Sink logits around the scores' scale, so they move every row's weights.
+  MetalBuffer sinks;
+  if (lilicorr) {
+    sinks = randomBfloat(backend, uint64_t{kKvHeads} * kQueryHeadsPerKv, random, "draft sinks");
+    auto *logits = static_cast<uint16_t *>(sinks.contents());
+    for (uint32_t head = 0; head < kKvHeads * kQueryHeadsPerKv; ++head)
+      logits[head] = floatToBf16(4.0F * bf16ToFloat(logits[head]));
+  }
   const uint64_t ringElements = uint64_t{kKvHeads} * kWindow * kHeadDim;
   // The grouped-queries tensor is sized by the plan so the split partials
   // behind the query rows end exactly at the allocation under validation.
@@ -185,7 +201,7 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
 
   CommandGraph graph;
   DraftAttention::addDecode(graph,
-      {queries, keys, values, queryKeys, queryValues},
+      {queries, keys, values, queryKeys, queryValues, sinks},
       std::span(cacheLengths).first(lanes), DraftAttention::plan(shape, lanes));
   const auto dispatches = graph.dispatches();
   require(dispatches.size() == 2 &&
@@ -194,7 +210,11 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
               dispatches[0].threadgroups.z == kSplits &&
               dispatches[1].threadgroups.x == kKvHeads &&
               dispatches[1].threadgroups.y == lanes &&
-              dispatches[1].threadgroups.z == 1,
+              dispatches[1].threadgroups.z == 1 &&
+              dispatches[0].pipelineName ==
+                  (lilicorr ? "draft_attention_bf16_split_window1024" : "draft_attention_bf16_split") &&
+              dispatches[1].pipelineName ==
+                  (lilicorr ? "draft_attention_bf16_reduce_sinks" : "draft_attention_bf16_reduce"),
           "draft attention core dispatch changed");
   static_cast<void>(backend.submitCommandAsync(dispatches).wait());
   // A cache length for each of the plan's lanes, no fewer.
@@ -202,7 +222,7 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
   rejects(
       [&] {
         DraftAttention::addDecode(mismatched,
-            {queries, keys, values, queryKeys, queryValues},
+            {queries, keys, values, queryKeys, queryValues, {}},
             std::span(cacheLengths).first(lanes - 1),
             DraftAttention::plan(shape, lanes));
       },
@@ -228,7 +248,8 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
               (uint64_t{lane} * kKvHeads + head) * kRows * kHeadDim,
           static_cast<const uint16_t *>(queryValues.contents()) +
               (uint64_t{lane} * kKvHeads + head) * kHeadDim * kRows,
-          cacheLengths[lane], reference);
+          cacheLengths[lane], reference, shape.window,
+          lilicorr ? static_cast<const uint16_t *>(sinks.contents()) + head * kQueryHeadsPerKv : nullptr);
       for (uint64_t index = 0; index < reference.size(); ++index) {
         const float actual = bf16ToFloat(output[queryOffset + index]);
         const float expected = reference[index];
@@ -808,7 +829,7 @@ void bufferExtents(MetalBackend &backend, DraftAttentionShape shape) {
   }
   const std::array<uint32_t, lanes> lengths{0, 2047, 6000};
   splash::test::requireExtents(backend, extents, [&](CommandGraph &graph, const Buffers &b) {
-    DraftAttention::addDecode(graph, {b[0], rings(b, 3), rings(b, 3 + lanes), b[1], b[2]}, lengths, plan);
+    DraftAttention::addDecode(graph, {b[0], rings(b, 3), rings(b, 3 + lanes), b[1], b[2], {}}, lengths, plan);
   });
   splash::test::requireExtents(backend,
                                Extents{{0, queryRows, 2, "draft grouped attention"}, {1, queryRows, 2, "draft attention"}},
@@ -881,6 +902,12 @@ int main(int argc, char **argv) {
       runCase(backend, 4, shape, {2046, 2049, 4095, 4096});
       runCase(backend, 2, shape, {8191, 262144, 0, 0});
     }
+    // Bolt's LiLiCorr draft: 1024 visible positions and sinks.
+    const DraftAttentionShape lilicorr{4096, 1024, 6144, 4096, 32, 8, 128, 1024};
+    for (const std::array<uint32_t, kLanes> &lengths :
+         {std::array<uint32_t, kLanes>{0, 0, 0, 0}, {1022, 1023, 1024, 0}, {2100, 4094, 6143, 1025},
+          {262137, 4094, 500, 6143}, {2046, 2049, 4095, 4096}})
+      runCase(backend, 4, lilicorr, lengths);
     std::cout << "draft_attention_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

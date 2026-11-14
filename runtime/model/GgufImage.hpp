@@ -93,6 +93,9 @@ struct TensorRows {
   SafetensorsSource safetensors{};
   TensorScale scale{};
   uint64_t ggufNvfp4RowBytes = 0;
+  // Q8_0 rows whose block scales the writer multiplies by `scale` (a
+  // Nemotron-H Mamba-2 projection's .scale, model/NemotronH.hpp).
+  bool ggufScaledQ8_0 = false;
   uint32_t ggufFloatType = 0;
   uint64_t ggufFloatRowBytes = 0;
   uint64_t first = 0; // the source row of image row 0
@@ -231,6 +234,9 @@ public:
   // expertRepack() keeps in Image::experts.
   [[nodiscard]] Repack expertPlanes(uint32_t format, uint64_t rows, uint64_t columns, const std::string &name);
   void expertRepack(Repack repack);
+  // The layer's routed experts are ungated (ops::MoeActivation::
+  // ReluSquared): its up and down alone follow, and its gate has no rows.
+  void ungatedExperts() noexcept { expertProjections_ = 1; }
   [[nodiscard]] Image finish();
 
 private:

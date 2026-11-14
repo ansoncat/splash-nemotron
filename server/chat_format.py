@@ -175,3 +175,16 @@ FLINT = ChatFormat(
     message_boundary="<|assistant|>",
     image_pad=None,
 )
+# Nemotron-H's (Nemotron 3.5 Bolt, runtime/model/NemotronH.hpp): </s>
+# and the turn end <|im_end|> as stop tokens, and a
+# ChatML template that opens the think block by enable_thinking and lays a
+# call out as Qwen's do.
+NEMOTRON = ChatFormat(
+    stop_tokens=("</s>", "<|im_end|>"),
+    think_end_id=13,
+    think_start_id=None,
+    call_open_id=14,
+    call_syntax=QWEN_XML,
+    message_boundary="<|im_end|>",
+    image_pad=None,
+)

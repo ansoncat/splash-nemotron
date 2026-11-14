@@ -79,7 +79,23 @@ public:
                             const metal::MetalBuffer &verifyRows, const VerifyRowsModel &model,
                             std::span<const uint32_t> maximumRows);
 
+  // add's checks of every buffer but the selector hidden rows and the
+  // codebooks, for a batch of these anchors and policies; returns its params.
+  SelectorBatchParams requireBuffers(const DraftSelectorBuffers &buffers, std::span<const uint32_t> anchors,
+                                     std::span<const SamplingPolicy> policies) const;
+  // add's first and last steps, for a selector that scores the candidates'
+  // edges itself (ops::LiLiCorr): each proposal position's shard partials of
+  // its sixteen most likely draft tokens; then the walk over the edge tables
+  // that follow the shard partials in partialValues, by the candidates and
+  // their unary scores.
+  void addTopCandidates(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, uint32_t lanes) const;
+  void addWalk(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, std::span<const uint32_t> anchors,
+               std::span<const SamplingPolicy> policies) const;
+
 private:
+  [[nodiscard]] SelectorBatchParams batchParams(std::span<const uint32_t> anchors,
+                                                std::span<const SamplingPolicy> policies) const;
+
   uint32_t vocabulary_ = 0;
 };
 

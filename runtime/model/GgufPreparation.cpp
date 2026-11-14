@@ -53,8 +53,9 @@ void requireRange(uint64_t offset, uint64_t bytes, uint64_t available) {
 // rows, which it builds from a quantized safetensors tensor's tensors, from
 // a GGUF's NVFP4 rows, or by quantizing a BF16 weight (into af4g64) or a
 // GGUF tensor of BF16 or F16 values (into Q8_0).
-enum class RowReader : uint8_t { Stored, Safetensors, GgufNvfp4, QuantizedBfloat16, QuantizedGgufFloat };
+enum class RowReader : uint8_t { Stored, Safetensors, GgufNvfp4, QuantizedBfloat16, QuantizedGgufFloat, ScaledQ8_0 };
 RowReader rowReader(const gguf::TensorRows &rows) {
+  if (rows.ggufScaledQ8_0) return RowReader::ScaledQ8_0;
   if (rows.safetensors.codes) return RowReader::Safetensors;
   if (rows.ggufNvfp4RowBytes) return RowReader::GgufNvfp4;
   if (rows.safetensors.bfloat16) return RowReader::QuantizedBfloat16;
@@ -313,6 +314,26 @@ void readGgufNvfp4Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t co
   }
 }
 
+// Q8_0 rows as stored, each block's half d times the row's tensor scale and
+// rounded back to half (a Nemotron-H Mamba-2 projection's .scale): the
+// products llama.cpp scales after the matmul, up to that rounding.
+void readScaledQ8_0Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, uint64_t column, uint64_t span,
+                        uint8_t *to) {
+  constexpr uint64_t kBlockBytes = 34;
+  if (column % kBlockBytes || span % kBlockBytes) throw GgufError("scaled Q8_0 rows must be read whole blocks");
+  const std::vector<float> g = tensorScales(rows, start, count);
+  for (uint64_t row = 0; row < count; ++row) {
+    uint8_t *out = to + row * span;
+    rows.file->readData(rows.offset + (start + row) * rows.rowBytes + column, {out, span});
+    for (uint64_t b = 0; b < span; b += kBlockBytes) {
+      _Float16 d;
+      std::memcpy(&d, out + b, 2);
+      d = static_cast<_Float16>(static_cast<float>(d) * g[row]);
+      std::memcpy(out + b, &d, 2);
+    }
+  }
+}
+
 // Image rows [first, first + count) of `rows`, bytes [column, column + span)
 // of each, back to back, from their column window on. Consecutive whole
 // source rows are read together.
@@ -334,6 +355,7 @@ void readRows(const gguf::TensorRows &rows, uint64_t first, uint64_t count, uint
     case RowReader::GgufNvfp4: readGgufNvfp4Rows(rows, start, run, column, span, out); break;
     case RowReader::QuantizedBfloat16: quantizeRows(rows, start, run, column, span, out); break;
     case RowReader::QuantizedGgufFloat: quantizeQ8_0Rows(rows, start, run, column, span, out); break;
+    case RowReader::ScaledQ8_0: readScaledQ8_0Rows(rows, start, run, column, span, out); break;
     }
     row += run;
   }

@@ -719,11 +719,14 @@ def run_text_only(port: int, model: str, nonce: str) -> None:
     print("text-only media refusal: PASS", flush=True)
 
 
-# A tool whose only valid call is {"value": "ok"}.
+# A tool whose only valid call is {"value": "ok"}. Strict, so its grammar
+# holds the call to it: Nemotron 3.5 Bolt otherwise writes the request's
+# nonce as the value.
 PROBE_TOOL = {
     "type": "function",
     "function": {
         "name": "record_probe",
+        "strict": True,
         "description": "Record the fixed smoke-test value.",
         "parameters": {
             "type": "object",

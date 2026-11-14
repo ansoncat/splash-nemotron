@@ -121,9 +121,10 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   for (const auto &projection : geometry.target.prefillProjections)
     linear.include(operators.linear().prefillScratchSize(projection));
   const auto &draft = geometry.draft;
-  for (const ops::ProjectionShape projection :
-       {ops::ProjectionShape{draft.hiddenSize, draft.targetHiddenSize()}, {draft.contextKvSize(), draft.hiddenSize}})
-    linear.include(operators.draftLinear().prefillScratchSize(projection));
+  if (draft.present())
+    for (const ops::ProjectionShape projection :
+         {ops::ProjectionShape{draft.hiddenSize, draft.targetHiddenSize()}, {draft.contextKvSize(), draft.hiddenSize}})
+      linear.include(operators.draftLinear().prefillScratchSize(projection));
   put(PrefillTensor::LinearPartials, linear.partials);
   put(PrefillTensor::LinearCounters, linear.counters);
   put(PrefillTensor::LinearTable, linear.input);
@@ -168,8 +169,10 @@ static uint64_t gdnPackedStride(const RuntimeGeometry &geometry) noexcept {
                             geometry.target.packedGdnWidth);
 }
 uint64_t gdnTapeSlotBytes(const RuntimeGeometry &geometry) noexcept {
-  return uint64_t{geometry.target.stateLayout.layers} *
-         ops::gdnTapeLayerBytes(geometry.target.gdnShape());
+  const QwenTargetGeometry &target = geometry.target;
+  return uint64_t{target.stateLayout.layers} *
+         (target.singleBlockLayers() ? mamba2TapeLayerBytes(target)
+                                     : ops::gdnTapeLayerBytes(target.gdnShape()));
 }
 static uint64_t decodeChunkLayerBytes(const RuntimeGeometry &geometry) noexcept {
   return bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
@@ -181,8 +184,9 @@ std::array<uint64_t, decodeTensorCount>
 decodeTensorBytes(const RuntimeGeometry &geometry,
                   const ops::ExecutionPlans &operators) {
   std::array<uint64_t, decodeTensorCount> result{};
-  const auto draftWorkspace =
-      operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape());
+  const auto draftWorkspace = geometry.draft.present()
+                                  ? operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape())
+                                  : ops::DraftAttentionWorkspace{};
   const auto samplingWorkspace = ops::Sampling::workspace(kDecodeRows);
   const auto selectorWorkspace = ops::DraftSelector::workspace(kDraftProposalTokens);
   auto put = [&](DecodeTensor tensor, uint64_t bytes) {
@@ -340,6 +344,7 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
   ops::LinearScratchSize result;
   // Includes the vocabulary head shared with the draft.
   for (const auto &p : geometry.target.decodeProjections) result.include(operators.linear().decodeScratchSize(p));
+  if (!d.present()) return result;
   for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
        {d.qkvSize, d.hiddenSize}, {d.contextKvSize(), d.hiddenSize},
        {d.hiddenSize, d.attentionSize},
