@@ -361,13 +361,15 @@ VISION_GEMM_KERNEL(vision_gemm_m32n256_relu2, 32, 256, VisionReluSquared,
                    false, bfloat)
 
 // LayerNorm with bias of an fp32 residual row (fp32 statistics), one
-// threadgroup per row.
+// threadgroup per row. The fp32 output may be the input (RADIO's final norm,
+// in place): each thread writes only the columns it last read.
 
+template <typename Output>
 kernel void vision_layer_norm(
     device const float *input [[buffer(0)]],
     device const bfloat *weight [[buffer(1)]],
     device const bfloat *bias [[buffer(2)]],
-    device bfloat *output [[buffer(3)]],
+    device Output *output [[buffer(3)]],
     constant VisionNormParams &params [[buffer(4)]],
     uint group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
@@ -376,7 +378,7 @@ kernel void vision_layer_norm(
 {
     threadgroup float reductions[8];
     device const float *row = input + ulong(group) * params.width;
-    device bfloat *out = output + ulong(group) * params.width;
+    device Output *out = output + ulong(group) * params.width;
 
     float sum = 0.0f;
     for (uint column = thread_index; column < params.width; column += 256) {
@@ -407,10 +409,17 @@ kernel void vision_layer_norm(
 
     for (uint column = thread_index; column < params.width; column += 256) {
         float normalized = (row[column] - mean) * inverse;
-        out[column] = bfloat(normalized * float(weight[column]) +
+        out[column] = Output(normalized * float(weight[column]) +
                              float(bias[column]));
     }
 }
+
+#define VISION_LAYER_NORM_KERNEL(name, Output)                                 \
+  template [[host_name(#name)]] kernel void vision_layer_norm<Output>(         \
+      device const float *, device const bfloat *, device const bfloat *,      \
+      device Output *, constant VisionNormParams &, uint, uint, uint, uint);
+VISION_LAYER_NORM_KERNEL(vision_layer_norm, bfloat)
+VISION_LAYER_NORM_KERNEL(vision_layer_norm_f32, float)
 
 // RADIO's merger norm: the RMS of a pixel-shuffled row of four consecutive
 // block-major fp32 residual rows (params.width, 5120) times its weight, fp32

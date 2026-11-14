@@ -29,7 +29,14 @@ SELECTOR_TOP_K = 16
 MASK_TOKEN_ID = 990
 VOCABULARY = 131072
 # The engine's draft context ring (ExecutionLimits::draftContextTokens): a
-# draft trained over a wider window sees the ring's positions.
+# draft trained over a wider window (Super's 8192) sees the ring's positions.
+# Super's draft also states RMS epsilon 1e-5 and its own output head; it runs
+# with the kernels' 1e-6 and the target's head. Its head is the target's,
+# rounded to NVFP4 (correlation 0.995 over 256 sampled rows), and its norms'
+# mean squares are 8 or more, where the epsilons' rsqrt differs by under 1e-6.
+# ponytail: its window is 8192, and the ring holds 2048, a compile-time size
+# of every draft kernel; acceptance at 33K tokens (0.50) matches short prompts
+# (0.47-0.51), so a wider ring waits for a prompt where acceptance drops.
 RING_WINDOW = 2048
 
 
@@ -202,7 +209,7 @@ def config(header):
             "rope_type": "default",
         },
         "sliding_window": min(value("dflash.attention.sliding_window"), RING_WINDOW),
-        # Bolt's draft adds a sink logit per query head; a draft may have none.
+        # Bolt's draft adds a sink logit per query head; Super's has none.
         "attention_sink_bias": "blk.0.attn_sinks.weight" in header.tensors,
         "tie_word_embeddings": False,
         "vocab_size": VOCABULARY,

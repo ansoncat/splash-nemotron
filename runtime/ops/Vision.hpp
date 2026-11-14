@@ -31,6 +31,9 @@ struct VisionLayout final {
   uint32_t prefixTokens = 0;
   // The merger's up-projection width.
   uint32_t mergerIntermediateSize = 4608;
+  // RADIO's final LayerNorm (v.post_ln) on the residual before the merger
+  // (Nemotron 3.5 Super's tower; Bolt's has none).
+  bool finalNorm = false;
 
   bool operator==(const VisionLayout &) const = default;
 };
@@ -43,6 +46,7 @@ inline constexpr VisionLayout kRadioVisionLayout{
 // Whether a layout is RADIO's, whatever text model it projects into.
 [[nodiscard]] constexpr bool isRadioVision(VisionLayout layout) noexcept {
   layout.outputHiddenSize = 0;
+  layout.finalNorm = false;
   return layout == kRadioVisionLayout;
 }
 
@@ -74,6 +78,7 @@ struct VisionWeights final {
   metal::MetalBuffer positionTable;
   std::vector<VisionBlock> blocks;
   VisionNorm mergerNorm;
+  VisionNorm finalNorm = {}; // RADIO's, when its layout has one
   VisionAffine mergerUpProjection;
   VisionAffine mergerDownProjection;
   metal::MetalBuffer prefixTokens = {};

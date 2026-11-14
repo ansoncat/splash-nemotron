@@ -45,6 +45,8 @@ model::DFlashDraftLayout draftOf(std::string_view family) {
     return test::flintDraft();
   if (family == model::NemotronHLayout{}.family)
     return test::nemotronBoltDraft();
+  if (family == model::kNemotronSuperLayout.family)
+    return test::nemotronSuperDraft();
   throw std::logic_error(std::string(family) + " has no draft to take its values with");
 }
 

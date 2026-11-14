@@ -397,6 +397,21 @@ class GgufMetadataTests(unittest.TestCase):
                 ),
             ):
                 config(shape)
+        # Super's table states a third extent of 1, and its tower ends in
+        # v.post_ln; Bolt's has neither, so it carries no final_norm.
+        self.assertEqual(config([1280, 16384, 1]), config([1280, 16384]))
+        self.assertNotIn("final_norm", config([1280, 16384]))
+        path = fixture_files.write_gguf(
+            self.root / "radio.gguf",
+            values,
+            [
+                ("v.position_embd.weight", [1280, 16384, 1], 0, b""),
+                ("v.post_ln.weight", [1280], 0, b""),
+            ],
+        )
+        self.assertIs(
+            gguf.vision_config(gguf.Metadata(path, tensors=True))["final_norm"], True
+        )
         # The metadata an installation derives reads the table too.
         config([1280, 16384])
         target = write_gguf(self.root / "target.gguf", fixture())

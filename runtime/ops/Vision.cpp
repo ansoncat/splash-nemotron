@@ -89,14 +89,17 @@ std::array<uint64_t, 12> scratchLayout(const VisionLayout &layout,
 }
 
 // Whether the layout is RADIO's; throws unless the kernels compile its tower.
-// Only the language-space projection width varies with the text model.
+// Only the language-space projection width varies with the text model, and
+// whether RADIO has its final norm.
 bool requireLayout(const VisionLayout &layout) {
   VisionLayout tower = layout;
   tower.outputHiddenSize = 0;
+  tower.finalNorm = false;
   if (std::find(kCompiledVision.begin(), kCompiledVision.end(), tower) == kCompiledVision.end() ||
       !layout.outputHiddenSize || layout.outputHiddenSize % kMergerColumnTile) {
     throw std::invalid_argument("no vision kernels for the tower");
   }
+  if (layout.finalNorm && !isRadioVision(tower)) throw std::invalid_argument("only RADIO has a final vision norm");
   return isRadioVision(tower);
 }
 
@@ -135,6 +138,7 @@ void requireWeights(const VisionWeights &model, bool radio) {
     requireAffine(block.upProjection, layout.paddedIntermediateSize, hidden, "vision up projection");
     requireAffine(block.downProjection, hidden, layout.paddedIntermediateSize, "vision down projection");
   }
+  if (layout.finalNorm) requireNorm(model.finalNorm, "vision final norm");
   if (radio)
     requireBytes(model.mergerNorm.weight, merged * kBf16Bytes, "vision merger norm weight");
   else
@@ -302,6 +306,9 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
   // consecutive block-major patches form one merged token. Qwen3.5 norms
   // each patch's row before, RADIO the merged row after.
   if (radio_) {
+    if (layout.finalNorm)
+      graph.add("vision_layer_norm_f32", {hidden, model_.finalNorm.weight, model_.finalNorm.bias, hidden},
+                VisionNormParams{layout.hiddenSize}, {patches, 1, 1});
     graph.add("vision_rms_norm", {hidden, model_.mergerNorm.weight, normalized},
               VisionNormParams{layout.mergedHiddenSize}, {merged, 1, 1});
     addGemm(graph, "vision_gemm_m32n256_relu2", normalized, {model_.mergerUpProjection.weight, zeros_}, qkv,

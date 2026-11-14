@@ -489,7 +489,7 @@ SERVE_OPTIONS = (
             "native window a model with YaRN turns it on, which is static and "
             "changes answers at every length, so pass more than the native "
             "window only when a request needs it (default: auto, the native "
-            "window when memory holds it)",
+            "window, at most 1010000, when memory holds it)",
         ),
         engine=EngineArgument(0, text=_auto_text, required=True),
     ),

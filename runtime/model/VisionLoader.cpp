@@ -19,7 +19,9 @@ using vision::Section;
 // nemotron_omni mmproj (no MLX source): the patch embedding (already in the
 // image's [channel, patch-row, patch-col] order, no bias), positions, prefix
 // tokens, each block's with its q, k and v weights and biases each one
-// tensor, and the merger's RMS weight and two projections, without biases.
+// tensor (bindMmproj fuses them for an mmproj that does), the final norm if
+// the layout has one, and the merger's RMS weight and two projections,
+// without biases.
 void planRadio(const ops::VisionLayout &l, std::vector<Section> &sections) {
   const auto add = [&](std::string gguf, uint32_t rows, uint32_t columns = 1, bool follows = false) {
     Section section{"", std::move(gguf), rows, columns, rows, columns};
@@ -48,6 +50,7 @@ void planRadio(const ops::VisionLayout &l, std::vector<Section> &sections) {
     affine(gguf + "ffn_up", l.intermediateSize, l.hiddenSize);
     affine(gguf + "ffn_down", l.hiddenSize, l.intermediateSize);
   }
+  if (l.finalNorm) norm("v.post_ln");
   add("mm.model.mlp.0.weight", l.mergedHiddenSize);
   add("mm.model.mlp.1.weight", l.mergerIntermediateSize, l.mergedHiddenSize);
   add("mm.model.mlp.3.weight", l.outputHiddenSize, l.mergerIntermediateSize);
@@ -207,18 +210,34 @@ void requireRadioMetadata(const GgufFile &gguf, const ops::VisionLayout &layout)
 // patch-col] weight per temporal frame (v.patch_embd.weight and .weight.1).
 // A nemotron_omni mmproj describes RADIO (requireRadioMetadata); its patch
 // embedding is one frame's, and the video frames' (v.patch_embd.weight.1)
-// images do not use.
+// images do not use. Its q, k and v may be one attn_qkv tensor (llama.cpp's
+// converter for Super), which then fills the three sections they follow in;
+// its position table may carry a trailing extent of 1.
 void bindMmproj(const GgufFile &gguf, const ops::VisionLayout &layout, Plan &plan) {
   const bool radio = ops::isRadioVision(layout);
   if (radio) requireRadioMetadata(gguf, layout);
   else requireMmprojMetadata(gguf, layout);
+  if (radio && gguf.find("v.blk.0.attn_qkv.weight")) {
+    std::erase_if(plan.sections, [](Section &s) {
+      const auto at = s.gguf.find(".attn_");
+      if (at == std::string::npos || s.gguf.size() < at + 8) return false;
+      const char head = s.gguf[at + 6];
+      if (head == 'q' && s.gguf[at + 7] == '.') {
+        s.gguf.replace(at + 6, 1, "qkv");
+        s.rows *= 3;
+        s.storedRows *= 3;
+      }
+      return (head == 'k' || head == 'v') && s.gguf[at + 7] == '.';
+    });
+  }
   const uint64_t p = layout.patchSize;
   std::set<std::string, std::less<>> used;
   if (radio) used.insert("v.patch_embd.weight.1");
   for (auto &s : plan.sections) {
     for (uint32_t frame = 0; frame < (s.patch ? 2u : 1u); ++frame) {
       std::string name = s.gguf + (frame ? ".1" : "");
-      const GgufTensor &t = gguf.require(name);
+      GgufTensor t = gguf.require(name);
+      while (t.dims.size() > 2 && t.dims.back() == 1) t.dims.pop_back();
       const bool patch = s.patch || (radio && &s == &plan.sections.front());
       const std::vector<uint64_t> shape = patch            ? std::vector<uint64_t>{p, p, 3, s.rows}
                                           : s.columns == 1 ? std::vector<uint64_t>{s.rows}

@@ -58,6 +58,19 @@ namespace splash::test {
   draft.lilicorr = true;
   return draft;
 }
+
+// Nemotron 3.5 Super's LiLiCorr draft as the installer converts it: no
+// sinks, its 8192 window narrowed to the ring's (install/dflash_gguf.py).
+[[nodiscard]] inline model::DFlashDraftLayout nemotronSuperDraft() {
+  constexpr std::array<uint32_t, 5> targetLayers{1, 22, 43, 64, 85};
+  model::DFlashDraftLayout draft = model::draftLayout(model::kNemotronSuperLayout.hiddenSize,
+                                                      model::kNemotronSuperLayout.vocabularySize, 5, 12288,
+                                                      1'000'000.0F, targetLayers);
+  draft.slidingWindow = model::ExecutionLimits::draftContextTokens;
+  draft.lilicorr = true;
+  return draft;
+}
+
 // The vision tower of Qwen3.8-27B, projecting into its hidden width.
 [[nodiscard]] constexpr ops::VisionLayout qwen3_8Vision() {
   return {.outputHiddenSize = model::Qwen3_8Layout{}.hiddenSize};

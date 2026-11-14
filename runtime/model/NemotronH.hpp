@@ -1,6 +1,6 @@
 #pragma once
 
-// Nemotron 3.5 Bolt (GGUF architecture nemotron_h_moe, model type
+// Nemotron 3.5 Bolt and Super (GGUF architecture nemotron_h_moe, model type
 // nemotron_h_moe_text): 88 layers of one block each, behind its own RMS norm,
 // in the same order.
 //  - Mamba-2 (40): in projection to z | x B C | dt, a 4-tap causal
@@ -13,7 +13,8 @@
 //    and scaled by 5) reads the hidden row; the routed experts (up and down,
 //    ReLU squared, no gate) run in a 1024-wide latent between two dense
 //    projections, and a shared expert of its own width (ReLU squared) reads
-//    the hidden row. Each MoE layer has its own expert count and width.
+//    the hidden row. Each of Bolt's MoE layers has its own expert count and
+//    width; Super's all route top-22 of 512 experts 2688 wide.
 // The layer numbering is the GGUF's: a draft's target_layer_ids name these
 // blocks. Its weights load from a GGUF only.
 
@@ -160,6 +161,20 @@ struct NemotronHLayout final : QwenHybridLayout {
     return boltTables(target) ? kBoltExpertWidths[layer] : target.expertIntermediateSize;
   }
 };
+
+// Nemotron 3.5 Super: Bolt's blocks and widths but for its experts and a
+// 1M-token window, served to kMaximumServedContextTokens.
+inline constexpr NemotronHLayout kNemotronSuperLayout{[] {
+  QwenHybridLayout family = NemotronHLayout{};
+  family.nativeContextTokens = 1'048'576;
+  family.experts = 512;
+  family.expertsPerToken = 22;
+  family.expertIntermediateSize = 2688;
+  family.family = "Nemotron-3.5-Super";
+  return family;
+}()};
+static_assert(!NemotronHLayout::boltTables(kNemotronSuperLayout) && kNemotronSuperLayout.moeBlockShape().valid());
+static_assert(kNemotronSuperLayout.maximumContextTokens() == kMaximumServedContextTokens);
 
 static_assert(NemotronHLayout::boltTables(NemotronHLayout{}) && NemotronHLayout{}.moeBlockShape().valid());
 static_assert(NemotronHLayout{}.attentionLayerCount() == 8 && NemotronHLayout{}.recurrentLayerCount() == 40);

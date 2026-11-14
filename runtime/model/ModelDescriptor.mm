@@ -830,6 +830,9 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   ops::VisionLayout vision =
       std::holds_alternative<NemotronHLayout>(*target) ? ops::kRadioVisionLayout : ops::VisionLayout{};
   vision.outputHiddenSize = std::visit([](const auto &layout) { return layout.hiddenSize; }, *target);
+  // RADIO's final norm is its mmproj's (install/gguf.py radio_vision_config).
+  if (ops::isRadioVision(vision))
+    vision.finalNorm = [config[@"vision_config"][@"final_norm"] isEqual:@YES];
   ModelDescriptor result =
       makeModelDescriptor(std::move(name), *target, dflashLayout, vision, targetSource, visionSource);
   if (result.hasVision())
@@ -867,7 +870,7 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
   std::visit(
       [&](const auto &layout) {
         result.capabilities = {layout.vocabularySize,
-                               layout.nativeContextTokens, sparseKvShape(layout)};
+                               layout.servedContextTokens({}), sparseKvShape(layout)};
         result.targetKvLayout = layout.kvLayout();
         result.stateLayout = {layout.gdnStateLayout(), draft.stateLayout()};
       },
@@ -914,7 +917,7 @@ ModelDescriptor servedFor(ModelDescriptor model, uint32_t contextTokens) {
     throw std::invalid_argument("the target's RoPE is already scaled");
   std::visit(
       [&](const auto &layout) {
-        if (contextTokens <= layout.nativeContextTokens)
+        if (contextTokens <= layout.servedContextTokens({}))
           return;
         if (contextTokens > layout.yarnContextTokens)
           throw std::invalid_argument(

@@ -55,6 +55,7 @@ void readRadio(WeightFile &file, const ops::VisionLayout &layout, ops::VisionWei
     block.downProjection = readAffine(file, layout.hiddenSize, layout.intermediateSize, "fc2");
     tensors.blocks.push_back(std::move(block));
   }
+  if (layout.finalNorm) tensors.finalNorm = readNorm(file, layout.hiddenSize, "final-norm");
   tensors.mergerNorm = {readTensor(file, layout.mergedHiddenSize, 1, "merger-norm"), {}};
   tensors.mergerUpProjection = {
       readTensor(file, layout.mergerIntermediateSize, layout.mergedHiddenSize, "merger-fc1"), {}};

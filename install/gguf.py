@@ -563,8 +563,13 @@ def radio_vision_config(vision):
         name: vision.positive("clip.vision." + key) for name, key in fields.items()
     }
     extents = vision.extents.get("v.position_embd.weight") or ()
+    if extents[2:] == (1,):  # Super's mmproj states a third extent of 1
+        extents = extents[:2]
     if len(extents) != 2 or extents[0] != result["hidden_size"]:
         raise ModelError("invalid GGUF vision position grid")
+    # Super's tower ends in a LayerNorm (v.post_ln), Bolt's does not.
+    if "v.post_ln.weight" in vision.extents:
+        result["final_norm"] = True
     result.update(
         temporal_patch_size=1,
         in_channels=3,
