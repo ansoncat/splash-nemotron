@@ -577,6 +577,9 @@ int extractVideoFrames(int argc, char **argv) {
       throw std::runtime_error("the video cannot be decoded");
   }
   std::sort(times.begin(), times.end());
+  // A frame is found by its time alone, so two frames may not share one.
+  if (std::adjacent_find(times.begin(), times.end()) != times.end())
+    throw std::runtime_error("the video has frames sharing a presentation time");
   const long total = static_cast<long>(times.size());
   const double sourceFps = video.nominalFrameRate;
   // Each side alone first: the container's size is untrusted and the
@@ -608,8 +611,7 @@ int extractVideoFrames(int argc, char **argv) {
   // Decoded frames arrive in decode order; each sampled one waits here until
   // those before it in presentation order are written.
   struct Output {
-    // Presentation time -> output positions: frames can share a time.
-    std::multimap<int64_t, size_t> wanted;
+    std::map<int64_t, size_t> wanted; // presentation time -> output position
     std::map<size_t, std::vector<uint8_t>> pending;
     size_t next = 0;
     long width = 0, height = 0;
@@ -672,8 +674,8 @@ int extractVideoFrames(int argc, char **argv) {
           session, sample, 0, nullptr,
           ^(OSStatus status, VTDecodeInfoFlags, CVImageBufferRef image, CMTime time, CMTime) {
             const std::lock_guard guard(state->lock);
-            const auto [first, last] = state->wanted.equal_range(tick(time));
-            if (first == last)
+            const auto wanted = state->wanted.find(tick(time));
+            if (wanted == state->wanted.end())
               return;
             if (status != noErr || !image ||
                 static_cast<long>(CVPixelBufferGetWidth(image)) != state->width ||
@@ -692,8 +694,7 @@ int extractVideoFrames(int argc, char **argv) {
                 pixel[0] = bgra[2], pixel[1] = bgra[1], pixel[2] = bgra[0];
               }
             CVPixelBufferUnlockBaseAddress(image, kCVPixelBufferLock_ReadOnly);
-            for (auto wanted = first; wanted != last; ++wanted)
-              state->pending.emplace(wanted->second, rgb);
+            state->pending.emplace(wanted->second, std::move(rgb));
             for (auto ready = state->pending.find(state->next); ready != state->pending.end();
                  ready = state->pending.find(state->next)) {
               std::fwrite(ready->second.data(), 1, ready->second.size(), stdout);
