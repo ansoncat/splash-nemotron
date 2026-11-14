@@ -1,15 +1,19 @@
 // The vision encoder's checks of what it reads, each buffer at its extent and
 // refused one element short: every weight of the tower when the encoder is
 // built, and an image's pixels and embedding rows when it encodes; and the
-// tower's blocks, refused one fewer or one more than its layout names. The
+// tower's blocks, refused one fewer or one more than its layout names. It
+// checks both towers the kernels compile, Qwen3.5's and RADIO's (prefix tokens,
+// a merger RMS weight, no patch or merger biases). The
 // test only encodes; every tensor is a view of one unwritten buffer.
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
+#include "model/NemotronH.hpp"
 #include "model/Qwen3_8.hpp"
 #include "ops/Vision.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -27,27 +31,32 @@ using test::requireExtent;
 constexpr uint64_t kBf16Bytes = 2;
 constexpr ops::ImageGrid kGrid{2, 2};
 
-void run(metal::MetalBackend &backend) {
-  const ops::VisionLayout layout{.outputHiddenSize = model::Qwen3_8Layout{}.hiddenSize};
+void run(metal::MetalBackend &backend, const ops::VisionLayout &layout, bool radio) {
   const uint64_t hidden = layout.hiddenSize, merged = layout.mergedHiddenSize;
-  // The largest tensor is the merger's down projection.
-  const metal::MetalBuffer storage =
-      test::sharedBuffer(backend, uint64_t{layout.outputHiddenSize} * merged * kBf16Bytes);
+  const uint64_t intermediate = layout.mergerIntermediateSize;
+  const uint64_t positions = uint64_t{layout.positionGridSide} * layout.positionGridSide * hidden;
+  // The largest tensor: a merger projection or the position table.
+  const metal::MetalBuffer storage = test::sharedBuffer(
+      backend, std::max({uint64_t{layout.outputHiddenSize} * intermediate * kBf16Bytes,
+                         intermediate * merged * kBf16Bytes, positions * kBf16Bytes}));
   const auto tensor = [&](uint64_t elements) { return backend.view(storage, 0, elements * kBf16Bytes); };
   const auto affine = [&](uint64_t output, uint64_t input) {
     return VisionAffine{tensor(output * input), tensor(output)};
   };
+  const auto unbiased = [&](uint64_t output, uint64_t input) { return VisionAffine{tensor(output * input), {}}; };
   const VisionNorm norm{tensor(hidden), tensor(hidden)};
   VisionWeights model;
   model.layout = layout;
-  model.patchEmbedding = affine(hidden, layout.patchDimension);
-  model.positionTable = tensor(uint64_t{layout.positionGridSide} * layout.positionGridSide * hidden);
+  model.patchEmbedding = radio ? unbiased(hidden, layout.patchDimension) : affine(hidden, layout.patchDimension);
+  model.positionTable = tensor(positions);
   model.blocks.assign(layout.depth, VisionBlock{norm, affine(3 * hidden, hidden), affine(hidden, hidden), norm,
                                                 affine(layout.paddedIntermediateSize, hidden),
                                                 affine(hidden, layout.paddedIntermediateSize)});
-  model.mergerNorm = norm;
-  model.mergerUpProjection = affine(merged, merged);
-  model.mergerDownProjection = affine(layout.outputHiddenSize, merged);
+  model.mergerNorm = radio ? VisionNorm{tensor(merged), {}} : norm;
+  model.mergerUpProjection = radio ? unbiased(intermediate, merged) : affine(intermediate, merged);
+  model.mergerDownProjection = radio ? unbiased(layout.outputHiddenSize, intermediate)
+                                     : affine(layout.outputHiddenSize, intermediate);
+  if (radio) model.prefixTokens = tensor(uint64_t{layout.prefixTokens} * hidden);
   const metal::MetalBuffer pixels = test::sharedBuffer(backend, kGrid.pixelBytes());
   const metal::MetalBuffer embeddings = test::sharedBuffer(
       backend, uint64_t{ops::Vision::embeddingRows(kGrid)} * layout.outputHiddenSize * kBf16Bytes);
@@ -72,13 +81,18 @@ void run(metal::MetalBackend &backend) {
                                        const std::string &name) {
     requireWeightExtent((model.*member).weight, output * input, name + " weight",
                         [&](VisionWeights &changed, const metal::MetalBuffer &view) { (changed.*member).weight = view; });
-    requireWeightExtent((model.*member).bias, output, name + " bias",
-                        [&](VisionWeights &changed, const metal::MetalBuffer &view) { (changed.*member).bias = view; });
+    if ((model.*member).bias)
+      requireWeightExtent((model.*member).bias, output, name + " bias",
+                          [&](VisionWeights &changed, const metal::MetalBuffer &view) { (changed.*member).bias = view; });
   };
   requireAffineExtent(&VisionWeights::patchEmbedding, hidden, layout.patchDimension, "vision patch embedding");
-  requireWeightExtent(model.positionTable, uint64_t{layout.positionGridSide} * layout.positionGridSide * hidden,
-                      "vision position table",
-                      [](VisionWeights &changed, const metal::MetalBuffer &view) { changed.positionTable = view; });
+  requireWeightExtent(
+      model.positionTable, positions, "vision position table",
+      [](VisionWeights &changed, const metal::MetalBuffer &view) { changed.positionTable = view; });
+  if (radio)
+    requireWeightExtent(
+        model.prefixTokens, uint64_t{layout.prefixTokens} * hidden, "vision prefix tokens",
+        [](VisionWeights &changed, const metal::MetalBuffer &view) { changed.prefixTokens = view; });
   for (const auto &[member, name] : {std::pair{&VisionBlock::norm1, "vision attention norm"},
                                      std::pair{&VisionBlock::norm2, "vision MLP norm"}})
     for (const auto &[field, part] : {std::pair{&VisionNorm::weight, " weight"}, std::pair{&VisionNorm::bias, " bias"}})
@@ -98,11 +112,16 @@ void run(metal::MetalBackend &backend) {
                           [&](VisionWeights &changed, const metal::MetalBuffer &view) {
                             changed.blocks.back().*member.*field = view;
                           });
-  for (const auto &[field, part] : {std::pair{&VisionNorm::weight, " weight"}, std::pair{&VisionNorm::bias, " bias"}})
-    requireWeightExtent(model.mergerNorm.*field, hidden, std::string("vision merger norm") + part,
-                        [&](VisionWeights &changed, const metal::MetalBuffer &view) { changed.mergerNorm.*field = view; });
-  requireAffineExtent(&VisionWeights::mergerUpProjection, merged, merged, "vision merger up projection");
-  requireAffineExtent(&VisionWeights::mergerDownProjection, layout.outputHiddenSize, merged,
+  if (radio)
+    requireWeightExtent(
+        model.mergerNorm.weight, merged, "vision merger norm weight",
+        [&](VisionWeights &changed, const metal::MetalBuffer &view) { changed.mergerNorm.weight = view; });
+  else
+    for (const auto &[field, part] : {std::pair{&VisionNorm::weight, " weight"}, std::pair{&VisionNorm::bias, " bias"}})
+      requireWeightExtent(model.mergerNorm.*field, hidden, std::string("vision merger norm") + part,
+                          [&](VisionWeights &changed, const metal::MetalBuffer &view) { changed.mergerNorm.*field = view; });
+  requireAffineExtent(&VisionWeights::mergerUpProjection, intermediate, merged, "vision merger up projection");
+  requireAffineExtent(&VisionWeights::mergerDownProjection, layout.outputHiddenSize, intermediate,
                       "vision merger down projection");
   for (const uint32_t depth : {layout.depth - 1, layout.depth + 1}) {
     VisionWeights changed = model;
@@ -128,7 +147,14 @@ int main(int argc, char **argv) {
   try {
     test::require(argc == 2, "usage: vision-metal METALLIB");
     metal::MetalBackend backend(argv[1]);
-    run(backend);
+    run(backend, ops::VisionLayout{.outputHiddenSize = model::Qwen3_8Layout{}.hiddenSize}, false);
+    ops::VisionLayout radio = ops::kRadioVisionLayout;
+    radio.outputHiddenSize = model::NemotronHLayout{}.hiddenSize;
+    run(backend, radio, true);
+    // A tower the kernels do not compile.
+    radio.heads = 20;
+    test::rejects([&] { static_cast<void>(ops::Vision::scratchBytes(radio, 4)); }, "no vision kernels for the tower",
+                  "an uncompiled tower was accepted");
     std::cout << "vision_metal_test: PASS\n";
     return 0;
   } catch (const std::exception &error) {

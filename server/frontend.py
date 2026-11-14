@@ -331,7 +331,9 @@ class Frontend:
             remaining_request_time(deadline)
             try:
                 payload = image_input.decode_data_url(part["image_url"]["url"])
-                image = self.images.prepare(payload, self.max_image_pixels)
+                image = self.images.prepare(
+                    payload, self.max_image_pixels, self.chat_format.image_resize
+                )
                 tokens += image.tokens
                 pixel_bytes += len(image.pixels)
                 self._check_image_request_size(
@@ -381,15 +383,11 @@ class Frontend:
         documentation or source containing literal vision tokens.
         """
         pad = self.chat_format.image_pad
+        source = template["chat_template"]
+        for site in self.chat_format.image_sites:
+            source = source.replace(site, site.replace(pad, IMAGE_RENDER_MARKER))
         rendered = self._apply_chat_template(
-            messages,
-            {
-                **template,
-                "tokenize": False,
-                "chat_template": template["chat_template"].replace(
-                    pad, IMAGE_RENDER_MARKER
-                ),
-            },
+            messages, {**template, "tokenize": False, "chat_template": source}
         )
         parts = rendered.split(IMAGE_RENDER_MARKER)
         image_offsets = set()
@@ -411,6 +409,14 @@ class Frontend:
         ]
         return list(encoded["input_ids"]), positions, rendered
 
+    def _image_wrap(self):
+        """The tokens before and after each image's pads: its family's open
+        and close, if any."""
+        return [
+            [self.tokenizer.convert_tokens_to_ids(tag)] if tag else []
+            for tag in (self.chat_format.image_open, self.chat_format.image_close)
+        ]
+
     def _check_image_placeholders(self, prompt_tokens, prepared, positions):
         """The rendered template holds one placeholder token per image."""
         pad_id = self.tokenizer.convert_tokens_to_ids(self.chat_format.image_pad)
@@ -419,10 +425,11 @@ class Frontend:
         ):
             raise APIError(400, "image count does not match the rendered template")
 
-    @staticmethod
-    def _image_token_count(prompt_tokens, prepared):
-        """The prompt's length once each image's placeholder is widened."""
-        return len(prompt_tokens) + sum(image.tokens - 1 for image in prepared)
+    def _image_token_count(self, prompt_tokens, prepared):
+        """The prompt's length once each image's placeholder is widened,
+        within its family's open and close."""
+        wrap = sum(map(len, self._image_wrap()))
+        return len(prompt_tokens) + sum(image.tokens - 1 + wrap for image in prepared)
 
     def _expand_image_pads(self, prompt_tokens, prepared, positions):
         """Widens the template's single placeholder per image to the image's
@@ -437,8 +444,10 @@ class Frontend:
         )
         expanded, spans, cursor = [], [], 0
         pad_id = self.tokenizer.convert_tokens_to_ids(self.chat_format.image_pad)
+        image_open, image_close = self._image_wrap()
         for position, image in zip(positions, prepared):
             expanded.extend(prompt_tokens[cursor:position])
+            expanded.extend(image_open)
             spans.append(
                 wire.ImageSpan(
                     len(expanded),
@@ -450,6 +459,7 @@ class Frontend:
                 )
             )
             expanded.extend([pad_id] * image.tokens)
+            expanded.extend(image_close)
             cursor = position + 1
         expanded.extend(prompt_tokens[cursor:])
         pixels = b"".join(image.pixels for image in prepared)

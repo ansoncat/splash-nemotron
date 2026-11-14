@@ -5,9 +5,11 @@ import io
 import json
 import random
 import struct
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -34,7 +36,7 @@ from server import chat_messages, documents, errors, images
 from server import frontend as request_frontend
 from server import protocol as native_wire
 from server import server as api
-from server.chat_format import QWEN
+from server.chat_format import NEMOTRON, QWEN
 from server.dialects import anthropic as anthropic_dialect
 from server.dialects import responses as responses_dialect
 
@@ -84,6 +86,74 @@ class SmartResizeTest(unittest.TestCase):
                     self.assertEqual(height % images.FACTOR, 0)
                     self.assertEqual(width % images.FACTOR, 0)
                     self.assertLessEqual(height * width, cap)
+
+
+class NemotronResizeTest(unittest.TestCase):
+    def test_patch_counts_follow_nemotron_omni_processor(self):
+        # Values from the processor's _compute_target_patches, whose rounding
+        # gives a whole odd count of patches one more (48 px: 4 patches).
+        for (height, width), expected in (
+            ((512, 512), (512, 512)),
+            ((448, 448), (512, 512)),
+            ((48, 48), (512, 512)),
+            ((190, 1352), (224, 1376)),
+            ((3000, 4000), (1600, 2112)),
+        ):
+            with self.subTest(shape=(height, width)):
+                self.assertEqual(
+                    images.nemotron_resize(height, width, images.MAX_PIXELS), expected
+                )
+
+    def test_serving_cap_bounds_the_budget_and_overrides_the_minimum(self):
+        self.assertEqual(images.nemotron_resize(448, 448, 65_536), (256, 256))
+        self.assertEqual(images.nemotron_resize(48, 48, 65_536), (64, 64))
+        # NVIDIA's processor's minimum gives 26x40 patches here, over a budget of 1028.
+        self.assertEqual(images.nemotron_resize(16, 36, 1028 * 256), (416, 608))
+
+    def test_sides_stay_merge_aligned_inside_the_budget(self):
+        rng = random.Random(7)
+        shapes = [(rng.randint(1, 8000), rng.randint(1, 8000)) for _ in range(300)]
+        for shape in shapes:
+            if max(shape) / min(shape) > 200:
+                continue
+            for cap in (images.MIN_PIXELS, 1028 * 256, images.MAX_PIXELS):
+                with self.subTest(shape=shape, cap=cap):
+                    height, width = images.nemotron_resize(*shape, cap)
+                    self.assertEqual(height % images.FACTOR, 0)
+                    self.assertEqual(width % images.FACTOR, 0)
+                    patches = height * width // images.PATCH**2
+                    self.assertLessEqual(
+                        patches,
+                        min(images.max_patches(cap), images.NEMOTRON_MAX_PATCHES),
+                    )
+
+    def test_float_resize_rounds_once(self):
+        import numpy as np
+        from PIL import Image
+
+        rng = np.random.default_rng(3)
+        source = Image.fromarray(rng.integers(0, 256, (37, 53, 3), dtype=np.uint8))
+        resized = np.asarray(images.resize_float(source, 96, 64))
+        expected = np.stack(
+            [
+                np.asarray(
+                    channel.convert("F").resize((96, 64), Image.Resampling.BICUBIC)
+                )
+                for channel in source.split()
+            ],
+            -1,
+        )
+        self.assertEqual(resized.shape, (64, 96, 3))
+        self.assertTrue((resized == np.clip(np.floor(expected + 0.5), 0, 255)).all())
+
+    def test_prepare_resizes_by_the_family_rule(self):
+        prepared = images.prepare(png_bytes(48, 48), images.MAX_PIXELS, "nemotron")
+        self.assertEqual((prepared.grid_height, prepared.grid_width), (32, 32))
+        cache = images.ImageCache()
+        payload = png_bytes(64, 64)
+        qwen = cache.prepare(payload, images.MAX_PIXELS)
+        nemotron = cache.prepare(payload, images.MAX_PIXELS, "nemotron")
+        self.assertEqual((qwen.grid_height, nemotron.grid_height), (16, 32))
 
 
 class PrepareTest(unittest.TestCase):
@@ -416,6 +486,116 @@ class ImageRequestTest(HarnessTestCase):
         for wrong in (prepared[:1], [*prepared, prepared[0]]):
             with self.assertRaisesRegex(api.APIError, "image count"):
                 app._check_image_placeholders(tokens, wrong, positions)
+
+    def test_nemotron_images_mark_template_sites_and_wrap_pads(self):
+        from tokenizers import pre_tokenizers
+        from transformers import PreTrainedTokenizerFast
+
+        backend = Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+        backend.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+        tokenizer = PreTrainedTokenizerFast(
+            tokenizer_object=backend,
+            additional_special_tokens=[
+                "<|im_start|>",
+                "<|im_end|>",
+                NEMOTRON.image_pad,
+                NEMOTRON.image_open,
+                NEMOTRON.image_close,
+            ],
+        )
+        fixtures_dir = Path(__file__).resolve().parents[1] / "fixtures"
+        template = {
+            "tokenize": True,
+            "return_dict": False,
+            "chat_template": (fixtures_dir / "chat_templates/bolt.jinja").read_text(),
+        }
+        app = object.__new__(request_frontend.Frontend)
+        app.tokenizer = tokenizer
+        app.chat_format = NEMOTRON
+        from server.latency import LatencyMetrics
+
+        app.latencies = LatencyMetrics()
+        app.backend = SimpleNamespace(
+            runtime=SimpleNamespace(
+                capabilities=SimpleNamespace(max_context_tokens=1024)
+            )
+        )
+        image = {"type": "image_url", "image_url": {"url": "unused"}}
+        messages = [
+            # Text quoting the placeholder is not an image.
+            {"role": "system", "content": "Read <image> literally"},
+            # Several images in a message are numbered: <image 1><image>...
+            {
+                "role": "user",
+                "content": [image, image, {"type": "text", "text": "Compare"}],
+            },
+            {"role": "assistant", "content": "Done"},
+            {"role": "user", "content": [image, {"type": "text", "text": "And?"}]},
+        ]
+        baseline = tokenizer.apply_chat_template(messages, **template)
+        pad, image_open, image_close = tokenizer.convert_tokens_to_ids(
+            [NEMOTRON.image_pad, NEMOTRON.image_open, NEMOTRON.image_close]
+        )
+        all_pads = [i for i, token in enumerate(baseline) if token == pad]
+        self.assertEqual(len(all_pads), 4)
+        tokens, positions, rendered = app._render_image_tokens(messages, template)
+        self.assertEqual(tokens, baseline)
+        self.assertIn("<image 1><image><image 2><image>Compare", rendered)
+        self.assertEqual(positions, all_pads[1:])
+        prepared = [
+            SimpleNamespace(
+                tokens=4,
+                grid_height=4,
+                grid_width=4,
+                digest_lo=i,
+                digest_hi=0,
+                pixels=bytes([i]),
+                frames=1,
+            )
+            for i in (1, 2, 3)
+        ]
+        expanded, spans, _ = app._expand_image_pads(tokens, prepared, positions)
+        expected = list(baseline)
+        for position in reversed(positions):
+            expected[position : position + 1] = [image_open, *[pad] * 4, image_close]
+        self.assertEqual(expanded, expected)
+        # The count a request is checked against includes each image's tags.
+        self.assertEqual(app._image_token_count(tokens, prepared), len(expected))
+        self.assertEqual(
+            [span.offset for span in spans],
+            [position + 1 + 5 * i for i, position in enumerate(positions)],
+        )
+        # The template drops a message's images where its text quotes the
+        # placeholder, so the images no longer match it.
+        quoting = [
+            {"role": "user", "content": [image, {"type": "text", "text": "<image>"}]}
+        ]
+        tokens, positions, _ = app._render_image_tokens(quoting, template)
+        with self.assertRaisesRegex(api.APIError, "image count"):
+            app._check_image_placeholders(tokens, prepared[:1], positions)
+
+    def test_images_resize_as_their_familys_processor_does(self):
+        image = SimpleNamespace(tokens=4, pixels=b"\x00")
+        for chat_format in (QWEN, NEMOTRON):
+            with self.subTest(resize=chat_format.image_resize):
+                app = object.__new__(request_frontend.Frontend)
+                app.chat_format = chat_format
+                app.max_image_pixels = 1 << 20
+                app.images = mock.Mock(request_batch=type("Batch", (list,), {}))
+                app.images.prepare.return_value = image
+                app._check_image_request_size = mock.Mock()
+                part = {"type": "image_url", "image_url": {"url": "unused"}}
+                with mock.patch.object(
+                    request_frontend.image_input, "decode_data_url", return_value=b""
+                ):
+                    prepared = app._prepare_images(
+                        [{"role": "user", "content": [part]}],
+                        deadline=time.monotonic() + 60,
+                    )
+                self.assertEqual(prepared, [image])
+                app.images.prepare.assert_called_once_with(
+                    b"", 1 << 20, chat_format.image_resize
+                )
 
     def test_image_render_marker_is_stable_across_requests(self):
         app = self.harness(FakeRuntime(), tokenizer=ImagePadTokenizer()).app

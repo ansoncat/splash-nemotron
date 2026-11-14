@@ -8,10 +8,11 @@
 
 namespace splash::ops {
 
-// A vision tower's geometry. The defaults are the one tower the kernels are
-// specialized for, Qwen3.5's 27 blocks; outputHiddenSize, the width of the
-// text model its merger projects into, is each family's, stated beside its
-// target (Qwen3_8.hpp, Qwen3_6Moe.hpp).
+// A vision tower's geometry. The kernels compile two (kCompiledVision,
+// Vision.cpp): the defaults, Qwen3.5's 27 blocks, and kRadioVisionLayout,
+// Nemotron 3.5 Bolt's RADIO. outputHiddenSize, the width of the text model
+// its merger projects into, is each family's, stated beside its target
+// (Qwen3_8.hpp, Qwen3_6Moe.hpp).
 struct VisionLayout final {
   uint32_t depth = 27;
   uint32_t hiddenSize = 1152;
@@ -25,9 +26,25 @@ struct VisionLayout final {
   uint32_t positionGridSide = 48;
   uint32_t patchSize = 16;
   uint32_t spatialMerge = 2;
+  // Learned tokens the tower attends with the patches and drops before the
+  // merger (RADIO's cls and registers).
+  uint32_t prefixTokens = 0;
+  // The merger's up-projection width.
+  uint32_t mergerIntermediateSize = 4608;
 
   bool operator==(const VisionLayout &) const = default;
 };
+
+// RADIO (C-RADIO ViT-H/16): 32 blocks 1280 wide, 16 heads of 80, MLP 5120,
+// single-frame 768-value patches, a 128x128 position table, 10 prefix tokens,
+// and a merger of RMS norm, 5120 -> 20480, ReLU squared, -> output.
+inline constexpr VisionLayout kRadioVisionLayout{
+    32, 1280, 768, 5120, 5120, 5120, 0, 16, 80, 128, 16, 2, 10, 20480};
+// Whether a layout is RADIO's, whatever text model it projects into.
+[[nodiscard]] constexpr bool isRadioVision(VisionLayout layout) noexcept {
+  layout.outputHiddenSize = 0;
+  return layout == kRadioVisionLayout;
+}
 
 struct VisionAffine final {
   metal::MetalBuffer weight;
@@ -48,6 +65,9 @@ struct VisionBlock final {
   VisionAffine downProjection;
 };
 
+// bf16 weights. RADIO's patch embedding and merger have no biases (their bias
+// buffers stay empty), and its merger norm is an RMS weight per merged value
+// (mergerNorm.weight, no bias).
 struct VisionWeights final {
   VisionLayout layout;
   VisionAffine patchEmbedding;
@@ -56,6 +76,7 @@ struct VisionWeights final {
   VisionNorm mergerNorm;
   VisionAffine mergerUpProjection;
   VisionAffine mergerDownProjection;
+  metal::MetalBuffer prefixTokens = {};
 };
 
 // Input geometry shared by the frontend and runtime: RGB patch size and the
@@ -154,7 +175,11 @@ private:
 
   const VisionWeights &model_;
   uint32_t maximumPatches_ = 0;
+  bool radio_ = false;
   metal::MetalBuffer arena_;
+  // The bias of RADIO's bias-free GEMMs, zero for the widest of them: the
+  // arena's end, which scratchBytes counts.
+  metal::MetalBuffer zeros_;
   metal::MetalBuffer scratch_[static_cast<uint32_t>(Scratch::Count)];
 };
 
