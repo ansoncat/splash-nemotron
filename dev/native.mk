@@ -788,7 +788,10 @@ test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 	family=$$($(BUILD_ID_PYTHON) -c '$(VISION_FIXTURE_FAMILY)' "$(MODEL_ROOT)") && \
 		if test -n "$$family"; then \
 			$(METAL_TEST_ENV) $(TEST_VISION_ENCODER_TEST) $(LIB) "$(MODEL_ROOT)" \
-				dev/tests/fixtures/vision-parity/$$family; \
+				dev/tests/fixtures/vision-parity/$$family && \
+			if test -d dev/tests/fixtures/vision-parity/$$family-video; then \
+				$(METAL_TEST_ENV) $(TEST_VISION_ENCODER_TEST) $(LIB) "$(MODEL_ROOT)" \
+					dev/tests/fixtures/vision-parity/$$family-video; fi; \
 		else echo "vision parity: skipped, the installation serves text only"; fi
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 $(ORACLE_ARGS)
 	state=$$($(PYTHON) -c '$(ORACLE_STATE_FORMAT)' "$(MODEL_ROOT)") && \

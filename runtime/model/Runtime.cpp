@@ -285,6 +285,11 @@ struct Runtime::Impl {
     uint64_t digestHi = 0;
     uint32_t gridHeight = 0;
     uint32_t gridWidth = 0;
+    uint32_t frames = 1;
+    // A pruned video's layout: its rows depend on more than its pixels.
+    uint32_t tokens = 0;
+    uint32_t tubelets = 1;
+    uint32_t textTokens = 0;
 
     bool operator==(const ImageKey &) const = default;
   };
@@ -303,6 +308,9 @@ struct Runtime::Impl {
   struct ImageRows final {
     ImageKey key;
     MetalBuffer pixels;
+    // A pruned video's encoded tubelets, text rows and EVS flags until its
+    // encode completes (pruningBytes).
+    MetalBuffer pruning;
     MetalBuffer embeddings;
     bool encoding = false;
     bool encoded = false;
@@ -710,12 +718,39 @@ struct Runtime::Impl {
   }
 
   uint64_t embeddingBytes(const ImageSpan &span) const {
-    return uint64_t{ops::Vision::embeddingRows(span.grid())} *
+    return uint64_t{span.pruned() ? span.tokens : ops::Vision::embeddingRows(span.grid())} *
            geometry.target.hiddenSize * sizeof(uint16_t);
   }
 
+  ops::VideoPruningShape pruningShape(const ImageSpan &span) const noexcept {
+    return {span.tubelets, span.grid(), geometry.target.hiddenSize, span.keptRows(), span.textTokens};
+  }
+
+  // A pruned video's encoded tubelets, its text rows, then its EVS
+  // dissimilarities and keep flags; nothing for any other span.
+  std::array<uint64_t, 4> pruningLayout(const ImageSpan &span) const noexcept {
+    if (!span.pruned()) return {};
+    const uint64_t row = uint64_t{geometry.target.hiddenSize} * sizeof(uint16_t);
+    const uint64_t flags = ops::VideoPruning::flagBytes(pruningShape(span));
+    return {uint64_t{span.tubelets} * ops::Vision::embeddingRows(span.grid()) * row,
+            uint64_t{span.textTokens} * row, flags, flags};
+  }
+
+  uint64_t pruningBytes(const ImageSpan &span) const noexcept {
+    uint64_t bytes = 0;
+    for (const uint64_t part : pruningLayout(span)) bytes += part;
+    return bytes;
+  }
+
+  // The pixels the engine stages: a pruned video's also hold its text's
+  // token ids, after its cuts.
+  static uint64_t stagedPixelBytes(const ImageSpan &span) noexcept {
+    return span.pixelBytes() + uint64_t{span.textTokens} * sizeof(uint32_t);
+  }
+
   static ImageKey imageKey(const ImageSpan &span) noexcept {
-    return {span.digestLo, span.digestHi, span.gridHeight, span.gridWidth};
+    return {span.digestLo, span.digestHi, span.gridHeight, span.gridWidth, span.frames,
+            span.tokens, span.tubelets, span.textTokens};
   }
 
   // The rows of an identical image that something still holds, moved to the
@@ -940,7 +975,7 @@ struct Runtime::Impl {
         rows = std::make_shared<ImageRows>();
         rows->key = imageKey(span);
         imageRows.insert_or_assign(rows->key, rows);
-        bytes += span.pixelBytes() + embeddingBytes(span);
+        bytes += stagedPixelBytes(span) + embeddingBytes(span) + pruningBytes(span);
       } else if (rows->embeddings && std::ranges::find(shared, rows) == shared.end()) {
         shared.push_back(rows);
       }
@@ -963,9 +998,15 @@ struct Runtime::Impl {
         if (image.rows && !image.rows->embeddings) {
           ImageRows &rows = *image.rows;
           rows.pixels = backend.allocateBuffer(
-              span.pixelBytes(), BufferStorage::Shared, "image pixels");
-          std::memcpy(contents<uint8_t>(rows.pixels, "image pixels"), pixels,
-                      static_cast<size_t>(span.pixelBytes()));
+              stagedPixelBytes(span), BufferStorage::Shared, "image pixels");
+          uint8_t *staged = contents<uint8_t>(rows.pixels, "image pixels");
+          std::memcpy(staged, pixels, static_cast<size_t>(span.pixelBytes()));
+          // A pruned video's text is its span's first prompt tokens.
+          if (span.pruned()) {
+            std::memcpy(staged + span.pixelBytes(), request.prompt.data() + span.offset,
+                        size_t{span.textTokens} * sizeof(uint32_t));
+            rows.pruning = backend.allocateBuffer(pruningBytes(span), BufferStorage::Private, "video pruning");
+          }
           rows.embeddings = backend.allocateBuffer(
               embeddingBytes(span), BufferStorage::Private, "image embeddings");
         }
@@ -1013,7 +1054,10 @@ struct Runtime::Impl {
       if (!rows.encoded && !rows.encoding) {
         if (!vision)
           throw std::logic_error("image request has no vision encoder");
-        vision->encode(encodes, image.span.grid(), rows.pixels, rows.embeddings);
+        if (image.span.pruned())
+          encodePrunedVideo(encodes, image.span, rows);
+        else
+          vision->encode(encodes, image.span.grid(), rows.pixels, rows.embeddings);
         rows.encoding = true;
         ++counters.imageEncodes;
       }
@@ -1024,6 +1068,30 @@ struct Runtime::Impl {
           {rowBegin + static_cast<uint32_t>(begin - chunkBegin), width, 0},
           static_cast<uint32_t>(end - begin), width);
     }
+  }
+
+  // A pruned video's tubelets one by one into its staging rows, its text's
+  // token rows, then EVS from them into its span's rows.
+  void encodePrunedVideo(CommandGraph &encodes, const ImageSpan &span, ImageRows &rows) {
+    const ops::ImageGrid grid = span.grid();
+    const auto layout = pruningLayout(span);
+    std::array<MetalBuffer, 4> parts;
+    uint64_t cursor = 0;
+    for (size_t part = 0; part < parts.size(); ++part) {
+      parts[part] = backend.view(rows.pruning, cursor, layout[part]);
+      cursor += layout[part];
+    }
+    const uint64_t tubeletRows = layout[0] / span.tubelets;
+    for (uint32_t tubelet = 0; tubelet < span.tubelets; ++tubelet)
+      vision->encode(encodes, grid, backend.view(rows.pixels, tubelet * grid.pixelBytes(), grid.pixelBytes()),
+                     backend.view(parts[0], tubelet * tubeletRows, tubeletRows));
+    const uint64_t cuts = uint64_t{span.tubelets} * grid.pixelBytes();
+    targetModel->addEmbedding(encodes,
+                              backend.view(rows.pixels, span.pixelBytes(), uint64_t{span.textTokens} * sizeof(uint32_t)),
+                              parts[1], span.textTokens);
+    ops::VideoPruning::add(encodes, pruningShape(span), parts[0], parts[1],
+                           backend.view(rows.pixels, cuts, uint64_t{span.tubelets} * sizeof(uint32_t)), parts[2],
+                           parts[3], rows.embeddings);
   }
 
   static float nextUniform(Request &entry) noexcept {
@@ -3191,6 +3259,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
           rows.encoding = false;
           rows.encoded = true;
           rows.pixels = MetalBuffer{};
+          rows.pruning = MetalBuffer{};
         }
         // Its last row is injected: the cache owns the rows from now on, so
         // reclaim can free them while the request decodes.

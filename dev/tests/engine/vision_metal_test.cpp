@@ -5,6 +5,9 @@
 // checks both towers the kernels compile, Qwen3.5's and RADIO's (prefix tokens,
 // a merger RMS weight, no patch or merger biases). The
 // test only encodes; every tensor is a view of one unwritten buffer.
+//
+// It also runs EVS (ops::VideoPruning) on three small tubelets with ties and
+// checks the span's rows against the processor's order computed here.
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "metal/CommandGraph.hpp"
@@ -14,7 +17,12 @@
 #include "ops/Vision.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <cstdint>
+#include <cstring>
+#include <numeric>
+#include <vector>
 #include <iostream>
 #include <string>
 #include <tuple>
@@ -48,6 +56,7 @@ void run(metal::MetalBackend &backend, const ops::VisionLayout &layout, bool rad
   VisionWeights model;
   model.layout = layout;
   model.patchEmbedding = radio ? unbiased(hidden, layout.patchDimension) : affine(hidden, layout.patchDimension);
+  if (radio) model.videoPatchEmbedding = unbiased(hidden, 2 * layout.patchDimension);
   model.positionTable = tensor(positions);
   model.blocks.assign(layout.depth, VisionBlock{norm, affine(3 * hidden, hidden), affine(hidden, hidden), norm,
                                                 affine(layout.paddedIntermediateSize, hidden),
@@ -141,6 +150,96 @@ void run(metal::MetalBackend &backend, const ops::VisionLayout &layout, bool rad
                 });
 }
 
+// Round to bf16, to nearest even, as Metal's bfloat conversion does.
+float bf16(float value) {
+  uint32_t bits = 0;
+  std::memcpy(&bits, &value, sizeof(bits));
+  bits = (bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000U;
+  std::memcpy(&value, &bits, sizeof(value));
+  return value;
+}
+
+uint16_t bf16Bits(float value) {
+  uint32_t bits = 0;
+  value = bf16(value);
+  std::memcpy(&bits, &value, sizeof(bits));
+  return static_cast<uint16_t>(bits >> 16);
+}
+
+// `kept` 7 keeps the most changed rows; 11 drops one of three tied rows,
+// the last. A NaN row sorts first, as in torch, and still exactly `kept`
+// rows are kept.
+void pruning(metal::MetalBackend &backend, uint32_t kept, bool nan = false) {
+  // Each row (1, s): its tubelets' slopes, with a repeat and two ties.
+  std::vector<std::vector<float>> slopes{
+      {0.0F, 0.5F, 1.0F, 2.0F}, {0.0F, 0.75F, 0.5F, 4.0F}, {0.0F, 0.75F, 2.0F, 0.25F}};
+  if (nan) slopes[1][2] = std::numeric_limits<float>::quiet_NaN();
+  const ops::VideoPruningShape shape{3, {4, 4, 2}, 256, kept, 5};
+  const std::vector<uint32_t> cuts{0, 2, 4};
+  const uint32_t rows = shape.grid.mergedTokens(), stride = ops::Vision::embeddingRows(shape.grid);
+  const uint32_t total = shape.tubelets * rows, width = shape.width;
+  const auto bytes = [&](uint64_t count) { return count * width * kBf16Bytes; };
+  const metal::MetalBuffer encoded = test::sharedBuffer(backend, bytes(uint64_t{shape.tubelets} * stride));
+  const metal::MetalBuffer text = test::sharedBuffer(backend, bytes(shape.textTokens));
+  const metal::MetalBuffer cutBuffer = test::sharedBuffer(backend, cuts.size() * sizeof(uint32_t));
+  const metal::MetalBuffer dissimilarity = test::sharedBuffer(backend, ops::VideoPruning::flagBytes(shape));
+  const metal::MetalBuffer keep = test::sharedBuffer(backend, ops::VideoPruning::flagBytes(shape));
+  const metal::MetalBuffer output = test::sharedBuffer(backend, bytes(shape.textTokens + shape.kept));
+  auto *values = static_cast<uint16_t *>(encoded.contents());
+  std::memset(values, 0, encoded.sizeBytes());
+  for (uint32_t t = 0; t < shape.tubelets; ++t)
+    for (uint32_t p = 0; p < rows; ++p) {
+      values[uint64_t{t * stride + p} * width] = bf16Bits(1.0F);
+      values[uint64_t{t * stride + p} * width + 1] = bf16Bits(slopes[t][p]);
+    }
+  auto *textValues = static_cast<uint16_t *>(text.contents());
+  for (uint32_t j = 0; j < shape.textTokens; ++j)
+    std::fill_n(textValues + uint64_t{j} * width, width, bf16Bits(100.0F + j));
+  std::memcpy(cutBuffer.contents(), cuts.data(), cuts.size() * sizeof(uint32_t));
+
+  metal::CommandGraph graph;
+  ops::VideoPruning::add(graph, shape, encoded, text, cutBuffer, dissimilarity, keep, output);
+  backend.preparePipelines(graph.dispatches());
+  static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+
+  // The processor's order: 1 - cosine of each row with its tubelet before,
+  // each step rounded to bf16; 255 for the first tubelet; stable descending.
+  std::vector<float> d(total, 255.0F);
+  for (uint32_t t = 1; t < shape.tubelets; ++t)
+    for (uint32_t p = 0; p < rows; ++p) {
+      const float a = slopes[t][p], b = slopes[t - 1][p];
+      const float an = bf16(std::sqrt(1.0F + a * a)), bn = bf16(std::sqrt(1.0F + b * b));
+      const float dot = bf16(bf16(bf16(1.0F / an) * bf16(1.0F / bn)) + bf16(bf16(a / an) * bf16(b / bn)));
+      d[t * rows + p] = bf16(1.0F - dot);
+    }
+  std::vector<uint32_t> order(total);
+  std::iota(order.begin(), order.end(), 0U);
+  std::stable_sort(order.begin(), order.end(), [&](uint32_t x, uint32_t y) {
+    return std::isnan(d[x]) ? !std::isnan(d[y]) : d[x] > d[y];
+  });
+  std::vector<bool> keeps(total);
+  for (uint32_t i = 0; i < shape.kept; ++i) keeps[order[i]] = true;
+  // The span's rows: text up to each tubelet's cut, its kept rows, the rest.
+  // Each is the bits of a text row's value, or of a tubelet row's slope.
+  std::vector<std::pair<bool, uint16_t>> expected;
+  uint32_t token = 0;
+  for (uint32_t t = 0; t < shape.tubelets; ++t) {
+    for (; token < cuts[t]; ++token) expected.emplace_back(true, bf16Bits(100.0F + token));
+    for (uint32_t p = 0; p < rows; ++p)
+      if (keeps[t * rows + p]) expected.emplace_back(false, bf16Bits(slopes[t][p]));
+  }
+  for (; token < shape.textTokens; ++token) expected.emplace_back(true, bf16Bits(100.0F + token));
+  test::require(expected.size() == shape.textTokens + shape.kept, "the reference lays out the wrong row count");
+  const auto *out = static_cast<const uint16_t *>(output.contents());
+  for (uint32_t row = 0; row < expected.size(); ++row) {
+    const uint16_t *got = out + uint64_t{row} * width;
+    const auto [isText, bits] = expected[row];
+    const bool matches = isText ? got[0] == bits && got[width - 1] == bits
+                                : got[0] == bf16Bits(1.0F) && got[1] == bits && got[width - 1] == 0;
+    test::require(matches, "video pruning row " + std::to_string(row) + " is not the processor's");
+  }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -151,6 +250,9 @@ int main(int argc, char **argv) {
     ops::VisionLayout radio = ops::kRadioVisionLayout;
     radio.outputHiddenSize = model::NemotronHLayout{}.hiddenSize;
     run(backend, radio, true);
+    pruning(backend, 7);
+    pruning(backend, 11);
+    pruning(backend, 7, true);
     // A tower the kernels do not compile.
     radio.heads = 20;
     test::rejects([&] { static_cast<void>(ops::Vision::scratchBytes(radio, 4)); }, "no vision kernels for the tower",

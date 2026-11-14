@@ -194,7 +194,8 @@ FLINT = ChatFormat(
 # ChatML template that opens the think block by enable_thinking and lays a
 # call out as Qwen's do. Its template writes <image> for an image, which its
 # processor (processing.py) widens between <img> and </img>; the template
-# also tests a message's text for <image>.
+# also tests a message's text for <image>. It writes <video> for a video,
+# which the processor widens to one labeled <img> run per two frames.
 NEMOTRON = ChatFormat(
     stop_tokens=("</s>", "<|im_end|>"),
     think_end_id=13,
@@ -207,4 +208,6 @@ NEMOTRON = ChatFormat(
     image_close="</img>",
     image_sites=("+ '<image>'", "'><image>'"),
     image_resize="nemotron",
+    video_pad="<video>",
+    video_sites=("+ '<video>'",),
 )

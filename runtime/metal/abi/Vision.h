@@ -59,3 +59,19 @@ struct VisionAttentionParams {
 
 static_assert(sizeof(VisionAttentionParams) == 12,
               "Vision attention parameters are 12 bytes on both sides");
+
+// A pruned video's EVS (ops::VideoPruning): `tubelets` tubelets of `rows`
+// merged rows each, `stride` rows apart in the encoded rows, `width` bf16
+// values wide; it keeps `kept` rows and lays them out among `text_tokens`
+// text rows.
+struct VideoPruningParams {
+  uint32_t tubelets;
+  uint32_t rows;
+  uint32_t stride;
+  uint32_t width;
+  uint32_t kept;
+  uint32_t text_tokens;
+};
+
+static_assert(sizeof(VideoPruningParams) == 24,
+              "Video pruning parameters are 24 bytes on both sides");

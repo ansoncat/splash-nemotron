@@ -205,7 +205,8 @@ $(HOST_STEP_LIB): $(HOST_STEP_SOURCE) | $(BUILD)
 ENGINE_BUILD := $(BUILD)/engine
 ENGINE_LIBRARY := $(ENGINE_BUILD)/libsplash.a
 ENGINE_LINKFLAGS := -framework Foundation -framework Metal -framework IOKit \
-	-framework IOSurface
+	-framework IOSurface -framework AVFoundation -framework CoreMedia \
+	-framework CoreVideo -framework VideoToolbox
 ENGINE_DEPFLAGS := -MMD -MP
 # Configuration belongs to each successful output, not to a shared timestamp:
 # macOS make can treat a new stamp and an old binary in the same second as equal.

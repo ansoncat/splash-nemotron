@@ -38,8 +38,8 @@ metal::MetalBuffer readTensor(WeightFile &file, uint32_t rows, uint32_t columns,
 }
 
 // RADIO's tensors in the order VisionLoader.cpp plans them (planRadio): no
-// patch or merger biases, the prefix tokens after the positions, and the
-// merger's RMS weight alone.
+// patch or merger biases, the prefix tokens after the positions, the
+// merger's RMS weight alone, and the video patch embedding last.
 void readRadio(WeightFile &file, const ops::VisionLayout &layout, ops::VisionWeights &tensors) {
   tensors.patchEmbedding = {readTensor(file, layout.hiddenSize, layout.patchDimension, "patch-embed"), {}};
   tensors.positionTable =
@@ -61,6 +61,7 @@ void readRadio(WeightFile &file, const ops::VisionLayout &layout, ops::VisionWei
       readTensor(file, layout.mergerIntermediateSize, layout.mergedHiddenSize, "merger-fc1"), {}};
   tensors.mergerDownProjection = {
       readTensor(file, layout.outputHiddenSize, layout.mergerIntermediateSize, "merger-fc2"), {}};
+  tensors.videoPatchEmbedding = {readTensor(file, layout.hiddenSize, 2 * layout.patchDimension, "video-patch-embed"), {}};
 }
 
 QwenVisionWeights readVision(metal::MetalBackend &backend, WeightImages &images,

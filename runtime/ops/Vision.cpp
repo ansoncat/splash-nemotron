@@ -60,7 +60,8 @@ uint64_t zeroBiasBytes(const VisionLayout &layout) noexcept {
 // whole 64-row tiles, attention reads whole 128-key tiles, and the merger
 // reads the normalized rows as (patches / 4, merged) and writes its up
 // projection's (patches / 4, mergerIntermediate) over the q/k/v rows. RADIO
-// has no rope, so its rope tables are a placeholder value.
+// has no rope, so its rope tables are a placeholder value, and its patch
+// rows are two frames wide for a video's tubelet.
 std::array<uint64_t, 12> scratchLayout(const VisionLayout &layout,
                                        uint32_t maximumPatches, bool radio) {
   const uint32_t tokens = maximumPatches + layout.prefixTokens;
@@ -71,7 +72,7 @@ std::array<uint64_t, 12> scratchLayout(const VisionLayout &layout,
   const uint64_t headRows = uint64_t{layout.heads} * padded;
   const uint64_t rope = radio ? kFloatBytes : uint64_t{maximumPatches} * layout.headDimension * kFloatBytes;
   return {
-      rows * layout.patchDimension * kBf16Bytes,                 // Patches
+      rows * layout.patchDimension * (radio ? 2 : 1) * kBf16Bytes, // Patches
       rope,                                                      // RopeCos
       rope,                                                      // RopeSin
       rows * hidden * kFloatBytes,                               // Hidden
@@ -126,6 +127,7 @@ void requireWeights(const VisionWeights &model, bool radio) {
     requireBytes(norm.bias, hidden * kBf16Bytes, name + " bias");
   };
   requireAffine(model.patchEmbedding, hidden, layout.patchDimension, "vision patch embedding", !radio);
+  if (radio) requireAffine(model.videoPatchEmbedding, hidden, 2 * layout.patchDimension, "vision video patch embedding", false);
   requireBytes(model.positionTable,
                uint64_t{layout.positionGridSide} * layout.positionGridSide * hidden * kBf16Bytes,
                "vision position table");
@@ -221,6 +223,7 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
   if (!grid.valid() || grid.patches() > maximumPatches_) {
     throw std::invalid_argument("image grid exceeds the vision encoder");
   }
+  if (grid.frames != 1 && !radio_) throw std::invalid_argument("only RADIO encodes video");
   const auto patches = static_cast<uint32_t>(grid.patches());
   const uint32_t tokens = patches + layout.prefixTokens;
   requireBytes(pixels, grid.pixelBytes(), "image pixel");
@@ -239,11 +242,13 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
   const MetalBuffer &context = scratch(Scratch::Context);
 
   if (radio_) {
-    graph.add("vision_patchify_radio", {pixels, scratch(Scratch::Patches)}, gridParams, {patches, 1, 1});
+    const bool video = grid.frames == 2;
+    graph.add(video ? "vision_patchify_radio_video" : "vision_patchify_radio", {pixels, scratch(Scratch::Patches)},
+              gridParams, {patches, 1, 1});
     graph.add("vision_prepare_positions_radio", {model_.positionTable, hidden}, gridParams, {patches, 1, 1});
     addGemm(graph, "vision_gemm_m64n128_residual", scratch(Scratch::Patches),
-            {model_.patchEmbedding.weight, zeros_}, hidden, hidden, layout.hiddenSize,
-            layout.patchDimension, patches, kGemmRowTile, kGemmColumnTile);
+            {(video ? model_.videoPatchEmbedding : model_.patchEmbedding).weight, zeros_}, hidden, hidden,
+            layout.hiddenSize, grid.frames * layout.patchDimension, patches, kGemmRowTile, kGemmColumnTile);
     // The prefix rows, past the embedding's last tile over them.
     graph.add("vision_prefix_radio", {model_.prefixTokens, hidden}, gridParams,
               {roundUp(tokens, kGemmRowTile) - patches, 1, 1});
@@ -327,6 +332,34 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
           embeddings,
           hidden, layout.outputHiddenSize, layout.mergerIntermediateSize, merged,
           kMergerRowTile, kMergerColumnTile);
+}
+
+uint64_t VideoPruning::flagBytes(const VideoPruningShape &shape) noexcept {
+  return uint64_t{shape.tubelets} * shape.grid.mergedTokens() * kFloatBytes;
+}
+
+void VideoPruning::add(CommandGraph &graph, const VideoPruningShape &shape, const MetalBuffer &encoded,
+                       const MetalBuffer &text, const MetalBuffer &cuts, const MetalBuffer &dissimilarity,
+                       const MetalBuffer &keep, const MetalBuffer &output) {
+  const uint32_t rows = shape.grid.mergedTokens();
+  const uint64_t total = uint64_t{shape.tubelets} * rows;
+  if (!shape.tubelets || shape.grid.frames != 2 || !shape.width || !shape.textTokens || shape.kept < rows ||
+      shape.kept > total || total + shape.textTokens > UINT32_MAX)
+    throw std::invalid_argument("invalid video pruning");
+  const uint32_t stride = Vision::embeddingRows(shape.grid);
+  requireBytes(encoded, uint64_t{shape.tubelets} * stride * shape.width * kBf16Bytes, "video tubelet rows");
+  requireBytes(text, uint64_t{shape.textTokens} * shape.width * kBf16Bytes, "video text rows");
+  requireBytes(cuts, uint64_t{shape.tubelets} * sizeof(uint32_t), "video text cuts");
+  requireBytes(dissimilarity, flagBytes(shape), "video dissimilarity");
+  requireBytes(keep, flagBytes(shape), "video keep flag");
+  requireBytes(output, (uint64_t{shape.textTokens} + shape.kept) * shape.width * kBf16Bytes, "video rows");
+  const VideoPruningParams params{shape.tubelets, rows, stride, shape.width, shape.kept, shape.textTokens};
+  const auto groups = static_cast<uint32_t>(total);
+  graph.add("video_pruning_dissimilarity", {encoded, dissimilarity}, params, {groups, 1, 1});
+  graph.add("video_pruning_keep", {dissimilarity, keep}, params,
+            {(groups + CommandGraph::kDefaultThreads - 1) / CommandGraph::kDefaultThreads, 1, 1});
+  graph.add("video_pruning_place", {encoded, text, cuts, keep, output}, params,
+            {groups + shape.textTokens, 1, 1});
 }
 
 } // namespace splash::ops

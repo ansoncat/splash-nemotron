@@ -611,6 +611,10 @@ class LauncherTests(unittest.TestCase):
             "--revision",
             "--draft-model",
             "--mmproj",
+            # CLI-only video options, which the desktop app does not offer.
+            "--video-fps",
+            "--video-max-frames",
+            "--video-pruning",
         }
         self.assertIn("--max-memory", flags)
         table = Path(launcher.__file__).resolve().parents[1] / (

@@ -20,8 +20,9 @@ using vision::Section;
 // image's [channel, patch-row, patch-col] order, no bias), positions, prefix
 // tokens, each block's with its q, k and v weights and biases each one
 // tensor (bindMmproj fuses them for an mmproj that does), the final norm if
-// the layout has one, and the merger's RMS weight and two projections,
-// without biases.
+// the layout has one, the merger's RMS weight and two projections, without
+// biases, and last the video patch embedding (two frames' [channel,
+// patch-row, patch-col] in a row, frame-major, also as stored).
 void planRadio(const ops::VisionLayout &l, std::vector<Section> &sections) {
   const auto add = [&](std::string gguf, uint32_t rows, uint32_t columns = 1, bool follows = false) {
     Section section{"", std::move(gguf), rows, columns, rows, columns};
@@ -54,6 +55,7 @@ void planRadio(const ops::VisionLayout &l, std::vector<Section> &sections) {
   add("mm.model.mlp.0.weight", l.mergedHiddenSize);
   add("mm.model.mlp.1.weight", l.mergerIntermediateSize, l.mergedHiddenSize);
   add("mm.model.mlp.3.weight", l.outputHiddenSize, l.mergerIntermediateSize);
+  add("v.patch_embd.weight.1", l.hiddenSize, 2 * l.patchDimension);
 }
 
 // The sections of layout, in file order, placed after the header block.
@@ -209,8 +211,8 @@ void requireRadioMetadata(const GgufFile &gguf, const ops::VisionLayout &layout)
 // preparation uses. The patch embedding is one [channel, patch-row,
 // patch-col] weight per temporal frame (v.patch_embd.weight and .weight.1).
 // A nemotron_omni mmproj describes RADIO (requireRadioMetadata); its patch
-// embedding is one frame's, and the video frames' (v.patch_embd.weight.1)
-// images do not use. Its q, k and v may be one attn_qkv tensor (llama.cpp's
+// embedding is one frame's, and v.patch_embd.weight.1 a video tubelet's two
+// frames (six channels). Its q, k and v may be one attn_qkv tensor (llama.cpp's
 // converter for Super), which then fills the three sections they follow in;
 // its position table may carry a trailing extent of 1.
 void bindMmproj(const GgufFile &gguf, const ops::VisionLayout &layout, Plan &plan) {
@@ -232,14 +234,14 @@ void bindMmproj(const GgufFile &gguf, const ops::VisionLayout &layout, Plan &pla
   }
   const uint64_t p = layout.patchSize;
   std::set<std::string, std::less<>> used;
-  if (radio) used.insert("v.patch_embd.weight.1");
   for (auto &s : plan.sections) {
     for (uint32_t frame = 0; frame < (s.patch ? 2u : 1u); ++frame) {
       std::string name = s.gguf + (frame ? ".1" : "");
       GgufTensor t = gguf.require(name);
       while (t.dims.size() > 2 && t.dims.back() == 1) t.dims.pop_back();
-      const bool patch = s.patch || (radio && &s == &plan.sections.front());
-      const std::vector<uint64_t> shape = patch            ? std::vector<uint64_t>{p, p, 3, s.rows}
+      const bool radioPatch = radio && (&s == &plan.sections.front() || s.gguf == "v.patch_embd.weight.1");
+      const std::vector<uint64_t> shape = s.patch          ? std::vector<uint64_t>{p, p, 3, s.rows}
+                                          : radioPatch     ? std::vector<uint64_t>{p, p, s.columns / (p * p), s.rows}
                                           : s.columns == 1 ? std::vector<uint64_t>{s.rows}
                                                            : std::vector<uint64_t>{s.columns, s.rows};
       if (t.dims != shape) throw WeightStoreError("vision tensor shape mismatch: " + name);

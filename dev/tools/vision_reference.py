@@ -26,7 +26,10 @@ one row, an RMS norm and a ReLU-squared MLP without biases.
 writes a small deterministic parity fixture (pixels, grid, fp32 embeddings)
 consumed by ``dev/tests/engine/vision_encoder_test.mm``. The fixtures in
 ``dev/tests/fixtures/vision-parity/`` are the default 96x128 image, but the
-35B's, which is ``--height 192 --width 192``.
+35B's, which is ``--height 192 --width 192``, and Bolt's, ``--width 160``:
+its 60 patches and 10 prefix tokens cross a 64-row tile. ``--frames 2`` writes a
+RADIO video tubelet's instead (``nemotron-3.5-bolt-video``): two frames, the
+second the first shifted and dimmed, through the video patch embedding.
 """
 
 import argparse
@@ -523,13 +526,15 @@ def write_fixture(
         expected = encode(layout, weights, pixels).astype(np.float32)
     out.mkdir(parents=True, exist_ok=True)
     (out / "grid.txt").write_text(
-        f"{pixels.shape[0] // PATCH} {pixels.shape[1] // PATCH}\n"
+        f"{height // PATCH} {width // PATCH}"
+        + (f" {frames}" if frames != 1 else "")
+        + "\n"
     )
     (out / "pixels.bin").write_bytes(pixels.tobytes())
     (out / "expected_fp32.bin").write_bytes(expected.tobytes())
     print(
-        f"wrote parity fixture for grid {pixels.shape[0] // PATCH}x"
-        f"{pixels.shape[1] // PATCH}: {expected.shape} embeddings"
+        f"wrote parity fixture for grid {height // PATCH}x{width // PATCH}"
+        f" of {frames} frame(s): {expected.shape} embeddings"
     )
 
 
@@ -539,5 +544,6 @@ if __name__ == "__main__":
     parser.add_argument("output", type=Path)
     parser.add_argument("--height", type=int, default=96)
     parser.add_argument("--width", type=int, default=128)
+    parser.add_argument("--frames", type=int, choices=(1, 2), default=1)
     args = parser.parse_args()
-    write_fixture(args.model, args.output, args.height, args.width)
+    write_fixture(args.model, args.output, args.height, args.width, args.frames)
