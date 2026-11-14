@@ -189,7 +189,8 @@ struct PlanOptions {
 };
 
 // The routed experts each layer's image streams (Image::experts), in layer
-// order; throws unless every layer's do.
+// order, past the layers of no routed experts (Nemotron-H's Mamba-2 and
+// attention layers); throws unless one does.
 [[nodiscard]] std::vector<StreamedExperts> streamedExperts(std::span<const Image> layers);
 // The bytes an image takes once loaded: none for a table whose rows stream.
 [[nodiscard]] uint64_t loadedBytes(const Image &image);

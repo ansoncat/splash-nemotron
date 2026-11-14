@@ -900,10 +900,9 @@ void requireRotation(const GgufFile &file, const QwenTargetDimensions &g, const 
 
 std::vector<StreamedExperts> streamedExperts(std::span<const Image> layers) {
   std::vector<StreamedExperts> result;
-  for (const Image &layer : layers) {
-    if (!layer.experts) throw GgufError("a target layer's experts do not stream");
-    result.push_back(*layer.experts);
-  }
+  for (const Image &layer : layers)
+    if (layer.experts) result.push_back(*layer.experts);
+  if (result.empty()) throw GgufError("no target layer's experts stream");
   return result;
 }
 
