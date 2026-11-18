@@ -122,6 +122,20 @@ void HyperConnection::addProject(metal::CommandGraph &graph, metal::MetalBuffer 
             {rows, 1, 1}, {kThreads, 1, 1});
 }
 
+void HyperConnection::addProjectLanes(metal::CommandGraph &graph, metal::MetalBuffer streams,
+                                      metal::MetalBuffer direction, metal::MetalBuffer laneRows, HyperShape shape,
+                                      const StepRows &step, uint32_t laneMask) {
+  requireShape(shape);
+  requireStepRows(step);
+  requireBytes(streams, streamBytes(shape, step.rows), "hyper-connection streams");
+  requireBytes(direction, uint64_t{shape.hidden} * sizeof(float), "hyper-connection direction");
+  requireBytes(laneRows, uint64_t{step.lanes} * sizeof(SplashLaneRows), "hyper-connection lane rows");
+  HyperConnectionParams params = hyperParams(shape, step.rows);
+  params.inject = laneMask;
+  graph.add("hyper_connection_project_lanes", {std::move(streams), std::move(direction), std::move(laneRows)},
+            params, {step.laneCap, step.lanes, 1}, {kThreads, 1, 1});
+}
+
 void HyperConnection::addStreamMean(metal::CommandGraph &graph, metal::MetalBuffer streams,
                                     metal::MetalBuffer destination, RowRegion to, HyperShape shape, uint32_t rows) {
   requireShape(shape);

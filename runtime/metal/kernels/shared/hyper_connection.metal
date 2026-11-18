@@ -1,5 +1,6 @@
 #include "metal/abi/HyperConnection.h"
 #include "metal/abi/KernelABI.h"
+#include "metal/abi/VerifyTree.h"
 #include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/gguf_sgmatrix.h"
 #include "metal/kernels/common/hyper_streams.h"
@@ -260,6 +261,16 @@ kernel void hyper_connection_combine(device float *streams [[buffer(0)]],
 
 // Each stream minus its component along the unit `direction` (fp32
 // [hidden]): a control vector's projection after a block, h -= (h . d) d.
+inline void hyper_project_row(device float *x, device const float *direction, constant HyperConnectionParams &p,
+                              threadgroup float *scratch, uint tid, uint lane, uint sg) {
+  float dots[kStreams] = {};
+  for (uint d = tid; d < p.hidden; d += kRowThreads)
+    for (uint s = 0; s < p.streams; ++s) dots[s] += x[s * p.hidden + d] * direction[d];
+  reduce_streams(dots, p.streams, scratch, lane, sg);
+  for (uint d = tid; d < p.hidden; d += kRowThreads)
+    for (uint s = 0; s < p.streams; ++s) x[s * p.hidden + d] -= dots[s] * direction[d];
+}
+
 kernel void hyper_connection_project(device float *streams [[buffer(0)]],
                                      device const float *direction [[buffer(1)]],
                                      constant HyperConnectionParams &p [[buffer(2)]],
@@ -269,13 +280,25 @@ kernel void hyper_connection_project(device float *streams [[buffer(0)]],
                                      uint sg [[simdgroup_index_in_threadgroup]]) {
   threadgroup float scratch[kSimdgroups * kStreams];
   if (row >= p.rows) return;
-  device float *x = streams + ulong(row) * p.streams * p.hidden;
-  float dots[kStreams] = {};
-  for (uint d = tid; d < p.hidden; d += kRowThreads)
-    for (uint s = 0; s < p.streams; ++s) dots[s] += x[s * p.hidden + d] * direction[d];
-  reduce_streams(dots, p.streams, scratch, lane, sg);
-  for (uint d = tid; d < p.hidden; d += kRowThreads)
-    for (uint s = 0; s < p.streams; ++s) x[s * p.hidden + d] -= dots[s] * direction[d];
+  hyper_project_row(streams + ulong(row) * p.streams * p.hidden, direction, p, scratch, tid, lane, sg);
+}
+
+// The same over a decode step's rows of the lanes whose bit `p.inject`
+// holds, each lane's rows where the step's layout places them; a
+// threadgroup per (row of a lane, lane).
+kernel void hyper_connection_project_lanes(device float *streams [[buffer(0)]],
+                                           device const float *direction [[buffer(1)]],
+                                           device const SplashLaneRows *lane_rows [[buffer(2)]],
+                                           constant HyperConnectionParams &p [[buffer(3)]],
+                                           uint2 group [[threadgroup_position_in_grid]],
+                                           uint tid [[thread_index_in_threadgroup]],
+                                           uint lane [[thread_index_in_simdgroup]],
+                                           uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float scratch[kSimdgroups * kStreams];
+  const SplashLaneRows rows = lane_rows[group.y];
+  if (!((p.inject >> group.y) & 1u) || group.x >= rows.rows) return;
+  hyper_project_row(streams + ulong(rows.first + group.x) * p.streams * p.hidden, direction, p, scratch, tid,
+                    lane, sg);
 }
 
 // The streams' start: every stream a copy of the token's embedding.

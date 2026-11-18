@@ -9,6 +9,7 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/HyperConnection.h"
+#include "ops/LaneRows.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/RowCopy.hpp"
 
@@ -52,6 +53,12 @@ struct HyperConnection final {
   // [hidden]): a control vector projected out after a block.
   static void addProject(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer direction,
                          HyperShape shape, uint32_t rows);
+  // The same over a decode step's rows of the lanes `laneMask` holds a bit
+  // of (bit L lane L), `laneRows` (SplashLaneRows) placing each lane's up to
+  // `step.laneCap` rows.
+  static void addProjectLanes(metal::CommandGraph &graph, metal::MetalBuffer streams, metal::MetalBuffer direction,
+                              metal::MetalBuffer laneRows, HyperShape shape, const StepRows &step,
+                              uint32_t laneMask);
   // The mean of each of `rows` rows' streams, as bf16 into `destination` at
   // `to`: Qwen3.8-Flash-Next's capture of a layer's output for its DFlash2
   // draft.
