@@ -1911,6 +1911,41 @@ void projectTest(MetalBackend &backend) {
       ok &= std::fabs(after) <= 1e-3;
     }
   check(ok, "project: every stream minus its component along the direction");
+
+  // The decode form: lanes packed at their own offsets, a padding row between
+  // two of them and a lane of no rows; only the lanes the mask selects
+  // project, every other row stays bit for bit.
+  const std::array<ops::LaneRows, 4> lanes{{{0, 3}, {4, 2}, {6, 4}, {10, 0}}};
+  const uint32_t total = 10;
+  const auto packed = randoms(rng, total * width, 2.0f);
+  const MetalBuffer laneRows = laneRowsOf(backend, lanes);
+  for (const uint32_t mask : {0b1101u, 0u}) {
+    MetalBuffer ys = upload(backend, packed);
+    CommandGraph lanesGraph;
+    ops::HyperConnection::addProjectLanes(lanesGraph, ys, upload(backend, direction), laneRows, shape, stepOf(lanes),
+                                          mask);
+    run(backend, lanesGraph);
+    const auto out = download<float>(ys, packed.size());
+    bool projected = true, kept = true;
+    for (uint32_t r = 0; r < total; ++r) {
+      bool selected = false;
+      for (uint32_t lane = 0; lane < lanes.size(); ++lane)
+        selected |= (mask >> lane & 1u) && r >= lanes[lane].first && r < lanes[lane].first + lanes[lane].rows;
+      for (uint32_t s = 0; s < streams; ++s) {
+        const float *in = packed.data() + r * width + s * hidden, *o = out.data() + r * width + s * hidden;
+        if (!selected) {
+          kept &= std::memcmp(in, o, hidden * sizeof(float)) == 0;
+          continue;
+        }
+        double dot = 0;
+        for (uint32_t d = 0; d < hidden; ++d) dot += double(in[d]) * direction[d];
+        for (uint32_t d = 0; d < hidden; ++d)
+          projected &= std::fabs(o[d] - (in[d] - dot * direction[d])) <= 1e-4 * (1 + std::fabs(in[d]));
+      }
+    }
+    check(projected && kept, mask ? "project lanes: the selected lanes project, padding and the others stay"
+                                  : "project lanes: no lane selected leaves every row");
+  }
 }
 
 // The PLE hash on the GPU against the same hash on the CPU, as
