@@ -15,9 +15,9 @@
 > Everything else is upstream. 中文說明：[README.zh-TW.md](README.zh-TW.md).
 >
 > - `nemotron` (this default branch): all of the fork's changes, merged with
->   upstream's 1.6.1 (`main` of November 11).
-> - `nemotron-1.6.1`: that merge as its own branch; `nemotron-1.6` is the
->   earlier merge with 1.6.0.
+>   upstream's 1.7.0.
+> - `nemotron-1.7`: that merge as its own branch; `nemotron-1.6.1` and
+>   `nemotron-1.6` are the earlier merges with 1.6.1 and 1.6.0.
 > - `main`: tracks upstream unchanged.
 > - Other branches each stack on the one before, on upstream's `main` of
 >   October 31 (after 1.5.0), for changes that may be proposed upstream:
