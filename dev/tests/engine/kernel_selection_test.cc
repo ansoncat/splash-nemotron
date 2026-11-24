@@ -55,6 +55,24 @@
 
 namespace {
 
+// A routing's activation is its own: ReLU^2 under Nemotron-H's router alone,
+// SwiGLU under the others, since each runs only the passes compiled for it.
+constexpr splash::ops::MoeShape routedShape(splash::ops::MoeRouter router, uint32_t sharedSlices, bool sharedGate,
+                                    splash::ops::MoeActivation activation, bool biased = false) {
+  splash::ops::MoeShape shape{.hiddenSize = 2048, .experts = 128, .expertsPerToken = 8, .expertIntermediateSize = 512,
+                      .router = router, .sharedSlices = sharedSlices, .sharedGate = sharedGate,
+                      .activation = activation};
+  if (biased) shape.selectionBias = true, shape.gateSoftcap = 4, shape.upSoftcap = 25;
+  return shape;
+}
+static_assert(routedShape(splash::ops::MoeRouter::SigmoidBiased, 0, false, splash::ops::MoeActivation::ReluSquared).valid());
+static_assert(!routedShape(splash::ops::MoeRouter::SigmoidBiased, 0, false, splash::ops::MoeActivation::SwiGlu).valid());
+static_assert(routedShape(splash::ops::MoeRouter::Softmax, 1, true, splash::ops::MoeActivation::SwiGlu).valid());
+static_assert(!routedShape(splash::ops::MoeRouter::Softmax, 1, true, splash::ops::MoeActivation::ReluSquared).valid());
+static_assert(!routedShape(splash::ops::MoeRouter::SigmoidNormalized, 2, false, splash::ops::MoeActivation::ReluSquared).valid());
+static_assert(routedShape(splash::ops::MoeRouter::SigmoidNormalized, 0, false, splash::ops::MoeActivation::SwiGlu, true).valid());
+static_assert(!routedShape(splash::ops::MoeRouter::SigmoidNormalized, 0, false, splash::ops::MoeActivation::ReluSquared, true).valid());
+
 using namespace splash;
 using namespace splash::ops;
 

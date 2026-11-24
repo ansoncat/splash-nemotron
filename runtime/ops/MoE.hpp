@@ -54,6 +54,8 @@ struct CompiledMoeRouting final {
   uint32_t gateSoftcap = 0;
   uint32_t upSoftcap = 0;
   std::string_view activationSuffix = "";
+  // The experts' activation: ReLU^2 runs the ungated up pass alone.
+  MoeActivation activation = MoeActivation::SwiGlu;
 };
 inline constexpr std::array kCompiledMoeRoutings{
     CompiledMoeRouting{MoeRouter::Softmax, 1, true, SPLASH_MOE_WIDE_EXPERT_SLOTS, "", ""},
@@ -66,7 +68,8 @@ inline constexpr std::array kCompiledMoeRoutings{
                        true, 4, 25, "_softcap4_25"},
     // Nemotron-H's: a biased sigmoid router, and no shared expert in the
     // block (the model runs its own).
-    CompiledMoeRouting{MoeRouter::SigmoidBiased, 0, false, SPLASH_MOE_WIDE_EXPERT_SLOTS, "_sigmoid_bias_s0", "_s0"},
+    CompiledMoeRouting{MoeRouter::SigmoidBiased, 0, false, SPLASH_MOE_WIDE_EXPERT_SLOTS, "_sigmoid_bias_s0", "_s0",
+                       false, 0, 0, "", MoeActivation::ReluSquared},
 };
 
 // A biased selection is the sigmoid router's, of a block without a shared
@@ -133,7 +136,8 @@ struct MoeShape final {
     for (const CompiledMoeRouting &compiled : kCompiledMoeRoutings)
       if (compiled.router == router && compiled.sharedSlices == sharedSlices && compiled.sharedGate == sharedGate &&
           compiled.selectionBias == selectionBias && compiled.gateSoftcap == gateSoftcap &&
-          compiled.upSoftcap == upSoftcap && experts <= compiled.maximumExperts)
+          compiled.upSoftcap == upSoftcap && compiled.activation == activation &&
+          experts <= compiled.maximumExperts)
         return &compiled;
     return nullptr;
   }
