@@ -26,7 +26,7 @@ if __name__ == "__main__" and not __package__:
     __package__ = "install"
 
 from server import serve_options
-from server.chat_format import FLINT, NEMOTRON, QWEN, ChatFormat
+from server.chat_format import FLINT, INKLING2, NEMOTRON, QWEN, ChatFormat
 
 from . import models
 
@@ -49,12 +49,16 @@ FLINT_SAMPLING = SamplingDefaults(temperature=1.0, top_p=0.95, top_k=20)
 # What NVIDIA's Nemotron 3.5 GGUFs state (general.sampling.temp and top_p,
 # no top_k), Bolt's and Super's alike.
 NEMOTRON_SAMPLING = SamplingDefaults(temperature=1.0, top_p=0.95, top_k=0)
+# What Inkling 2's GGUF release states (general.sampling.temp, top_p, top_k):
+# temperature 1.0 over every token.
+INKLING2_SAMPLING = SamplingDefaults(temperature=1.0, top_p=1.0, top_k=0)
 
 
 @dataclass(frozen=True)
 class ModelFamily:
     # The family's name, as the engine names it (each target layout's family,
-    # runtime/model/Qwen3_8.hpp, Qwen3_6Moe.hpp, Qwen4Exp.hpp, Flint.hpp and NemotronH.hpp).
+    # runtime/model/Qwen3_8.hpp, Qwen3_6Moe.hpp, Qwen4Exp.hpp, Flint.hpp,
+    # Inkling2Loop.hpp and NemotronH.hpp).
     name: str
     # The repository of the DFlash2 draft released for the family, as its
     # release publishes it (config.json and BF16 safetensors), or as one
@@ -96,6 +100,14 @@ FAMILIES = (
     ),
     # It has no vision tower.
     ModelFamily("Flint", "incoai/Flint-DFlash2", FLINT, FLINT_SAMPLING, vision=False),
+    # Its vision tower is not served yet.
+    ModelFamily(
+        "Inkling-2-Mini",
+        "incoai/Inkling-2-Mini-DFlash2",
+        INKLING2,
+        INKLING2_SAMPLING,
+        vision=False,
+    ),
     # Its LiLiCorr draft is released as a GGUF only. Its
     # RADIO tower loads from a GGUF projector only. Its Mamba-2 state is
     # fp32 only (runtime/model/NemotronHTarget.cpp).
@@ -129,10 +141,12 @@ def option_report(engine_facts):
     """What each family, by name, makes of the options of `splash serve`,
     from its facts: engine_facts, each family's facts of its layout by name,
     as the engine's families command gives them, and its own vision tower
-    and reasoning switch. Each family's report holds the flags of the
-    options that need a fact it lacks (ServeOption.needs, LAUNCHER_NEEDS),
-    which act on none of its models, and the context its models serve:
-    their native window, and the most past it, with YaRN."""
+    and what a request's effort does to its reasoning (whether it reaches
+    the model, and whether it turns the reasoning on and off). Each family's
+    report holds the flags of the options that need a fact it lacks
+    (ServeOption.needs, LAUNCHER_NEEDS), which act on none of its models,
+    and the context its models serve: their native window, and the most past
+    it, with YaRN."""
     needs = {
         option.flag: option.needs
         for option in serve_options.SERVE_OPTIONS
@@ -144,6 +158,7 @@ def option_report(engine_facts):
         facts = engine | {
             "vision": family.vision,
             "reasoning_switch": family.chat_format.reasoning_switch,
+            "prompt_switches_reasoning": family.chat_format.prompt_switches_reasoning,
         }
         report[family.name] = {
             "unusable": [flag for flag, fact in needs.items() if not facts[fact]],

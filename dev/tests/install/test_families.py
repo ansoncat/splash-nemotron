@@ -43,14 +43,30 @@ UNUSABLE = {
         "--thinking-token-budget",
         "--thinking-end-text",
     },
+    # Its effort reaches its template, which tells the model, but the model
+    # opens its reasoning itself, which no thinking budget caps; it has no
+    # recurrent state and its vision tower is not served yet.
+    "Inkling-2-Mini": {
+        "--language-only",
+        "--state-format",
+        "--cached-states",
+        "--ple-memory",
+        "--sparse-kv-memory",
+        "--disable-ane",
+        "--recalibrate-ane",
+        "--max-image-pixels",
+        "--thinking-token-budget",
+        "--thinking-end-text",
+    },
     "Nemotron-3.5-Bolt": {"--ple-memory", "--sparse-kv-memory", "--disable-ane", "--recalibrate-ane"},
     "Nemotron-3.5-Super": {"--ple-memory", "--sparse-kv-memory", "--disable-ane", "--recalibrate-ane"},
 }
-# The context each family serves natively and at most, where it is not the
-# Qwen families' 262144 stretched by YaRN to 1010000; Super's native window is
-# served to that bound.
+# The context each family's models serve: their native window, and the most
+# past it, with YaRN, which stretches only the Qwen families'. Inkling 2's own
+# window, 1048576 tokens, is served up to the most --max-context takes.
 CONTEXT = {
     "Flint": (262144, 262144),
+    "Inkling-2-Mini": (1010000, 1010000),
     "Nemotron-3.5-Bolt": (262144, 262144),
     "Nemotron-3.5-Super": (1048576, 1010000),
 }
@@ -66,8 +82,8 @@ class OptionReportTests(unittest.TestCase):
             {name: set(family["unusable"]) for name, family in report.items()},
             UNUSABLE,
         )
-        # Flint and Nemotron serve their native windows alone, Super's to the
-        # bound below; YaRN stretches the others'.
+        # Flint, Inkling 2 and Nemotron serve their native windows alone,
+        # Super's to the bound below; YaRN stretches the others'.
         self.assertEqual(
             {
                 name: (family["context_tokens"], family["max_context_tokens"])

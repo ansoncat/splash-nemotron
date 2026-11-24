@@ -77,6 +77,8 @@ NemotronHTarget::NemotronHTarget(const NemotronHWeights &weights, const QwenTarg
   // state (RuntimeResources' exactCachedStates).
   if (geometry_.stateLayout.format != ops::GdnStateFormat::Float32 || geometry_.stateLayout.cachedCodes)
     throw std::invalid_argument("Nemotron-H keeps its Mamba-2 state, cached states too, in fp32");
+  requireSharedAttention();
+  requireDraftRows(false, false);
   const std::vector<uint64_t> decodeSizes = decodeTensorBytes(geometry_), prefillSizes = prefillTensorBytes(geometry_);
   decode_ = backend_.allocateBuffer(totalBytes(decodeSizes), metal::BufferStorage::Shared, "nemotron-h-decode-scratch");
   prefill_ =

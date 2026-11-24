@@ -6,7 +6,7 @@
 
 // The stored block of every format (ops::StoredRows), one struct per format:
 // a row is hidden / Weights blocks of Bytes bytes, each laid out as the format's
-// ggml block_* (an MLX affine, nvfp4 or fp8 tensor: the loader's block of
+// ggml block_* (an MLX affine, nvfp4, fp8 or mxfp8 tensor: the loader's block of
 // metal/abi/QuantFormat.h) at the byte offsets its struct names, and decode is
 // element dim's fp32 value, which the token gathers round once to bf16 and
 // load-time widening writes as F32 (kernels/shared/embedding.metal). Every
@@ -288,9 +288,9 @@ struct GgufEmbedNVFP4 {
     return float(kFP4Values[q]) * (float(quant_e4m3_pair(block[Scales + l / 16]).x) * (128.0f * g));
   }
 };
-// NVFP4G64's loader block, GgufEmbedNVFP4's of 64 elements: uchar scales[4] | float g | uchar codes[32].
-struct GgufEmbedNVFP4G64 {
-  enum : uint { Weights = 64, Bytes = 40, Scales = 0, G = quant_nvfp4_g(64), Codes = G + 4 };
+// Its 64-element form (nvfp464): uchar scales[4] | float g | uchar codes[32], decoded alike.
+struct GgufEmbedNVFP464 {
+  enum : uint { Weights = 64, Bytes = 40, Scales = 0, G = QUANT_NVFP464_G, Codes = QUANT_NVFP464_CODES };
   __attribute__((always_inline)) static float decode(device const uchar *block, uint dim) {
 #pragma clang fp reassociate(off)
     const uint l = dim % Weights;
@@ -307,6 +307,15 @@ struct GgufEmbedFP8 {
   __attribute__((always_inline)) static float decode(device const uchar *block, uint dim) {
 #pragma clang fp reassociate(off)
     return float(quant_e4m3_pair(block[Values + dim % Weights]).x) * (256.0f * as_type<float>(gguf_u32(block, G)));
+  }
+};
+// The loader's mxfp8 block: uchar e | uchar values[32], E4M3 values under the group's E8M0 exponent e; value =
+// (e4m3 / 2^8) 2^(e - 119), as the projections' coefficient scales it (quant_mxfp8_scale).
+struct GgufEmbedMXFP8 {
+  enum : uint { Weights = 32, Bytes = 33, E = 0, Values = 1 };
+  __attribute__((always_inline)) static float decode(device const uchar *block, uint dim) {
+#pragma clang fp reassociate(off)
+    return float(quant_e4m3_pair(block[Values + dim % Weights]).x) * quant_mxfp8_scale(block[E]);
   }
 };
 // MLX affine {bf16 s, bf16 z, codes}: element l of the group is code l of the codes' little-endian bit string of
@@ -386,14 +395,13 @@ GGUF_EMBED_AFFINE(8)
   X(pq20, GgufEmbedPQ20) X(q20, GgufEmbedQ20) X(iq4nl, GgufEmbedIQ4NL) X(iq4xs, GgufEmbedIQ4XS)                    \
   X(iq3s, GgufEmbedIQ3S) X(iq3xxs, GgufEmbedIQ3XXS) X(iq2xxs, GgufEmbedIQ2XXS) X(iq2xs, GgufEmbedIQ2XS)            \
   X(iq2s, GgufEmbedIQ2S) X(iq1s, GgufEmbedIQ1S) X(iq1m, GgufEmbedIQ1M) X(mxfp4, GgufEmbedMXFP4)                    \
-  X(nvfp4, GgufEmbedNVFP4) X(fp8, GgufEmbedFP8)                                                                   \
+  X(nvfp4, GgufEmbedNVFP4) X(nvfp464, GgufEmbedNVFP464) X(fp8, GgufEmbedFP8) X(mxfp8, GgufEmbedMXFP8)              \
   X(af2g32, GgufEmbedAF2G32) X(af2g64, GgufEmbedAF2G64) X(af2g128, GgufEmbedAF2G128)                               \
   X(af3g32, GgufEmbedAF3G32) X(af3g64, GgufEmbedAF3G64) X(af3g128, GgufEmbedAF3G128)                               \
   X(af4g32, GgufEmbedAF4G32) X(af4g64, GgufEmbedAF4G64) X(af4g128, GgufEmbedAF4G128)                               \
   X(af5g32, GgufEmbedAF5G32) X(af5g64, GgufEmbedAF5G64) X(af5g128, GgufEmbedAF5G128)                               \
   X(af6g32, GgufEmbedAF6G32) X(af6g64, GgufEmbedAF6G64) X(af6g128, GgufEmbedAF6G128)                               \
-  X(af8g32, GgufEmbedAF8G32) X(af8g64, GgufEmbedAF8G64) X(af8g128, GgufEmbedAF8G128)                               \
-  X(nvf4g64, GgufEmbedNVFP4G64)
+  X(af8g32, GgufEmbedAF8G32) X(af8g64, GgufEmbedAF8G64) X(af8g128, GgufEmbedAF8G128)
 #define GGUF_EMBEDDING_FORMATS(X) GGUF_QUANTIZED_EMBEDDING_FORMATS(X) X(bf16, GgufEmbedBF16) X(f16, GgufEmbedF16)
 #define GGUF_EMBEDDING_ONE(f, F) +1
 static_assert(0 GGUF_EMBEDDING_FORMATS(GGUF_EMBEDDING_ONE) == GGUF_FMT_COUNT, "GGUF_EMBEDDING_FORMATS lists every format");

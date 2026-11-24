@@ -63,6 +63,8 @@ NemotronHLayerWeights readLayer(WeightFile &file, const NemotronHLayout &layout,
       m.experts.slots = count;
       m.experts.chunks = ops::residentExpertChunks(m.experts);
     }
+    m.experts.expertScales = file.section(
+        checkedMultiply<WeightStoreError>(uint64_t{3} * count, kFloat32Bytes, "expert scale bytes"), "expert-scales");
     m.latentUp = readBlockProjection(file, layout.hiddenSize, layout.moeLatentSize, "latent-up");
     m.sharedUp = readBlockProjection(file, layout.sharedIntermediateSize, layout.hiddenSize, "shared-up");
     m.sharedDown = readBlockProjection(file, layout.hiddenSize, layout.sharedIntermediateSize, "shared-down");

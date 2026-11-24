@@ -52,9 +52,9 @@ inline constexpr uint32_t kQ8_0 = ggmlType("Q8_0"), kQ3_K = ggmlType("Q3_K"), kQ
 inline int failures = 0;
 
 // One tensor of the MLX quantization fixture (dev/tests/fixtures/mlx-quantization), which
-// dev/tools/mlx_quantization_fixture.py writes with MLX: its mode (affine, mxfp4 or nvfp4), bits, group size and
-// shape, MLX's packed codes, scales (bf16, or mxfp4's E8M0 and nvfp4's E4M3 bytes) and an affine tensor's bf16
-// biases, and MLX's reading of it, an affine tensor's codes and the fp32 values.
+// dev/tools/mlx_quantization_fixture.py writes with MLX: its mode (affine, mxfp4, nvfp4 or mxfp8), bits, group size
+// and shape, MLX's packed codes, scales (bf16, or mxfp4's and mxfp8's E8M0 and nvfp4's E4M3 bytes) and an affine
+// tensor's bf16 biases, and MLX's reading of it, an affine tensor's codes and the fp32 values.
 struct MlxTensor {
   std::string mode;
   uint32_t bits = 0, group = 0, rows = 0, columns = 0;
@@ -62,8 +62,10 @@ struct MlxTensor {
   [[nodiscard]] bool affine() const { return mode == "affine"; }
   // Its format (metal/abi/QuantFormat.h).
   [[nodiscard]] Fmt format() const {
-    return affine() ? Fmt(quant_affine_format_of(bits, group))
-                    : mode == "nvfp4" ? gguf_reference::NVFP4 : gguf_reference::MXFP4;
+    return affine()          ? Fmt(quant_affine_format_of(bits, group))
+           : mode == "nvfp4" ? gguf_reference::NVFP4
+           : mode == "mxfp8" ? gguf_reference::MXFP8
+                             : gguf_reference::MXFP4;
   }
   [[nodiscard]] std::vector<uint8_t> native() const {
     return gguf_reference::mlxNative(format(), rows, columns, weight, scales, biases);
@@ -166,8 +168,8 @@ inline std::vector<uint8_t> fixture(Fmt f, uint32_t rows, uint32_t K, uint32_t s
 
 // The GGUF tensor type of a format's tensors: its table type, or llama.cpp's
 // NVFP4 for NVFP4, whose native rows the loader builds from it; none for the
-// loader's other formats (MLX affine, FP8, and NVFP4G64, which llama.cpp's
-// NVFP4 loads as only when its rows are not whole 256s: checkGgufNvfp4).
+// loader's other formats (MLX affine, FP8, and NVFP4's 64-element form, which
+// NVFP4 rows that are not whole 256-element blocks take).
 inline std::optional<uint32_t> ggufType(uint32_t format) {
   if (format == GGUF_FMT_NVFP4) return model::ggml::kNVFP4;
   if (quant_loader_format(format)) return std::nullopt;

@@ -724,6 +724,11 @@ struct Runtime::Impl {
   // Whether a streamed-expert target's cycles plan a draft's block a lane
   // (RuntimeInstrumentation::planBlocks).
   bool blockPlans = false;
+  // The captured rows of positions 0 .. replacedCaptureRows - 1 that every
+  // prefill command's draft reads in place of those its target captured
+  // (RuntimeInstrumentation::replaceCapturedRows).
+  std::optional<MetalBuffer> replacedCaptures;
+  uint32_t replacedCaptureRows = 0;
   // Whether commands copy the target's logits before their policy
   // (RuntimeInstrumentation::captureTargetLogits), and the copies, one per
   // batch lane of the last command that made them.
@@ -738,6 +743,9 @@ struct Runtime::Impl {
   // The tokens a constrained request's next cycle gives rows of its tree,
   // by request (RuntimeInstrumentation::replaceTreeTokens).
   std::unordered_map<uint64_t, std::vector<std::pair<uint32_t, uint32_t>>> treeTokens;
+  // The temperature and noise a request's next cycle draws its tree at, by
+  // request (RuntimeInstrumentation::redrawTree).
+  std::unordered_map<uint64_t, std::pair<float, uint64_t>> treeDraws;
 #endif
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
@@ -769,7 +777,7 @@ struct Runtime::Impl {
     }
     if (value.model.draft.layout.present())
       draftModel.emplace(value.model.draft, value.backend, operators, targetModel->vocabularyProjection(),
-                         geometry.target.draftVocabulary);
+                         geometry.target.draftVocabulary, geometry.target.logitFinish());
     prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators);
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
     // Without a draft each cycle's trees grow from the anchors alone, but the
@@ -796,7 +804,16 @@ struct Runtime::Impl {
     if (model.expertStore())
       mostStepRows = std::min(mostStepRows, ExpertStore::cycleRows());
     stepClasses = operators.decodeRowClasses(mostStepRows, moe);
-    prefillClasses = operators.prefillRowClasses(moe);
+    // A target whose layers attend through relative attention picks those
+    // kernels by a chunk's rows too, in each variant its layout states
+    // (QwenHybridLayout::relativeAttention), over its KV pages.
+    const std::vector<ops::RelativeAttentionVariant> relativeAttention = std::visit(
+        [](const auto &layout) {
+          const auto variants = layout.relativeAttention();
+          return std::vector<ops::RelativeAttentionVariant>(variants.begin(), variants.end());
+        },
+        geometry.layout);
+    prefillClasses = operators.prefillRowClasses(moe, relativeAttention, geometry.target.kvLayout);
     if (value.verifyRows == VerifyRows::Auto && draftModel) {
       verifyBudget.emplace();
       if (model.expertStore()) {
@@ -1429,14 +1446,18 @@ struct Runtime::Impl {
       draftCos = targetCos;
       draftSin = targetSin;
     }
+    // A target without RoPE builds no target tables, its draft's alone.
+    const uint32_t rotatedRows = geometry.target.rotaryPairs ? targetRows : 0;
+    if (!draftModel) draftRows = 0;
+    if (!rotatedRows && !draftRows) return;
     ops::RoPE::addTables(
         graph, std::move(targetPositions), std::move(draftPositions),
         prefillArena->get(PrefillTensor::TargetInverseFrequencies),
         std::move(draftFrequencies),
         std::move(targetCos), std::move(targetSin), std::move(draftCos),
         std::move(draftSin),
-        {.target_rows = targetRows,
-         .draft_rows = draftModel ? draftRows : 0,
+        {.target_rows = rotatedRows,
+         .draft_rows = draftRows,
          .target_scale = geometry.target.ropeScaling.attentionFactor()},
         kPrefillRows, geometry.target.rotaryPairs);
   }
@@ -2195,7 +2216,7 @@ struct Runtime::Impl {
     if (!capturesInDecode())
       return;
     CommandGraph graph;
-    encodeCapture(graph, lane, stateLane, states.current(stateLane).stateBase, states.window(stateLane), 1, 0,
+    encodeCapture(graph, lane, stateLane, states.current(stateLane), states.window(stateLane), 1, 0,
                   {1, kDraftRows, ops::verifyLaneCap(kDraftRows, 1)});
     backend.preparePipelines(graph.dispatches());
   }
@@ -2210,6 +2231,20 @@ struct Runtime::Impl {
   void addDraftContext(CommandGraph &graph, std::span<const PrefillChunk> chunks, uint32_t index) {
     const PrefillChunk &chunk = chunks[index];
     if (!draftModel || !chunk.capturedRows) return;
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+    if (replacedCaptures) {
+      const uint32_t width = geometry.target.capturedHiddenSize();
+      for (const PrefillSequence &sequence : chunk.sequences)
+        for (const DispatchDraftCaptureSpan &capture : sequence.captures) {
+          if (capture.absoluteEnd > replacedCaptureRows)
+            throw std::invalid_argument("the replaced captured rows end before a prompt's");
+          ops::RowCopy::add(graph, *replacedCaptures, {capture.absoluteBegin, width, 0},
+                            prefillArena->get(PrefillTensor::Captured, index),
+                            {sequence.captureBegin + capture.compactDestinationRow, width, 0},
+                            capture.absoluteEnd - capture.absoluteBegin, width);
+        }
+    }
+#endif
     std::array<DFlashPrefillSpan, kLaneCount * 2> spans{};
     uint32_t spanCount = 0;
     std::vector<DFlashWindowCapture> windowCaptures;
@@ -2487,12 +2522,10 @@ struct Runtime::Impl {
     return anchors;
   }
 
-  // A target whose commit writes auxiliary state after every retained row
-  // has none of a fold's rows alone to give, nor has Nemotron-H's Mamba-2
-  // (single-block layers), which GDN's fold does not compute.
-  bool capturesInDecode() const noexcept {
-    return !geometry.target.stateLayout.auxiliaryBytes && !geometry.target.singleBlockLayers();
-  }
+  // A target that folds its state at a boundary inside a verify's retained
+  // rows (QwenTarget::foldsState) captures it there; one whose commit alone
+  // writes its auxiliary state has none of a fold's rows alone to give.
+  bool capturesInDecode() const noexcept { return targetModel->foldsState(); }
 
   // The state a decode item captures, at most one: at the page boundary
   // past the lane's position that a verify block's rows may reach within the
@@ -2634,6 +2667,13 @@ struct Runtime::Impl {
         tree.temperature = policy.temperature;
         tree.noise = entry.cycleNoise;
       }
+#ifdef SPLASH_RUNTIME_INSTRUMENTATION
+      if (const auto draws = treeDraws.find(entry.id); draws != treeDraws.end()) {
+        tree.temperature = draws->second.first;
+        tree.noise = draws->second.second;
+        treeDraws.erase(draws);
+      }
+#endif
     }
     const ops::DraftSelectorBuffers selection{
         d(DecodeTensor::Logits),          d(DecodeTensor::TopPartialIds),   d(DecodeTensor::TopPartialValues),
@@ -2957,8 +2997,8 @@ struct Runtime::Impl {
         step, maximumRetained, geometry.target.stopTokens);
   }
 
-  // Each lane's accepted path's K/V at the slots of their depths
-  // (ops::PagedAttention::addPathCommit): the verify stored its block's rows
+  // Each lane's accepted path's K/V at the slots of their depths, through the
+  // target (QwenTarget::addKvPathCommit): the verify stored its block's rows
   // at the slots of their rows, from the lane's position.
   void encodeKvPathCommit(CommandGraph &graph, std::span<Request *const> entries,
                           std::span<const ModelBatchItem> items, const ops::StepRows &step) {
@@ -2969,9 +3009,9 @@ struct Runtime::Impl {
       committed[lane] = static_cast<uint32_t>(items[lane].logicalPosition);
     }
     const auto lanes = static_cast<uint32_t>(entries.size());
-    ops::PagedAttention::addPathCommit(graph, kvPages.layout(), kvPages.extentPages(), std::span(tables).first(lanes),
-                                       std::span(committed).first(lanes), step.laneCap,
-                                       decodeArena->batchSlice(DecodeTensor::RetainedRows, lanes));
+    targetModel->addKvPathCommit(graph, kvPages.layout(), kvPages.extentPages(), std::span(tables).first(lanes),
+                                 std::span(committed).first(lanes), step.laneCap,
+                                 decodeArena->batchSlice(DecodeTensor::RetainedRows, lanes));
   }
 
   // The target's commit after acceptance (QwenTarget::addStateCommit): each
@@ -3001,11 +3041,13 @@ struct Runtime::Impl {
   // the path of its rows its acceptance wrote (DecodeTensor::
   // RetainedRows): the capture folds the path's first `rows` rows of the
   // verify's tape into the state the verify wrote and stores the result's
-  // codes in the state's cell (QwenTarget::addStateFold), and their context
-  // rows, which the draft's commit normalized, in the state's window. The
-  // completion seals the state only where the lane retained them
-  // (finalizeDecode). A boundary past the rows the lane may retain this
-  // cycle (`maximumRetained`) is none of its cycle's (prepareDecodeCapture).
+  // codes in the state's cell (QwenTarget::addStateFold), a folding family's
+  // auxiliary state those rows' fold of what its commit reads
+  // (Inkling2LoopTarget::addStateFold), and their context rows, which the
+  // draft's commit normalized, in the state's window. The completion seals
+  // the state only where the lane retained them (finalizeDecode). A
+  // boundary past the rows the lane may retain this cycle
+  // (`maximumRetained`) is none of its cycle's (prepareDecodeCapture).
   void encodeDecodeCaptures(CommandGraph &graph, std::span<Request *const> entries,
                             std::span<const ModelBatchItem> items, std::span<const uint32_t> maximumRetained,
                             const ops::StepRows &step) {
@@ -3015,24 +3057,31 @@ struct Runtime::Impl {
         if (rows > maximumRetained[lane])
           continue;
         const QwenCachedBuffers &state = static_cast<QwenStateReservation &>(*capture.reservation).buffers();
-        encodeCapture(graph, lane, entries[lane]->stateLane, state.gdn->buffers().stateBase, state.window->buffer(),
-                      rows, static_cast<uint32_t>(items[lane].logicalPosition), step);
+        encodeCapture(graph, lane, entries[lane]->stateLane, state.gdn->buffers(), state.window->buffer(), rows,
+                      static_cast<uint32_t>(items[lane].logicalPosition), step);
       }
     }
   }
 
   // A capture's commands on decode lane `lane` of state lane `stateLane`
   // (encodeDecodeCaptures), in a cycle of `step`: the fold of the first
-  // `rows` rows of the lane's retained path in the verify's tape into the GDN
-  // state `fold` and the commit of their context rows, from `position`, to
-  // the state's `window`.
-  void encodeCapture(CommandGraph &graph, uint32_t lane, uint32_t stateLane, const MetalBuffer &fold,
+  // `rows` rows of the lane's retained path into the cached cell `fold`, the
+  // GDN state's from the verify's tape and the auxiliary state's from the
+  // lane's before the step, and the commit of their context rows, from
+  // `position`, to the state's `window`.
+  void encodeCapture(CommandGraph &graph, uint32_t lane, uint32_t stateLane, const GdnParityBuffers &fold,
                      const MetalBuffer &window, uint32_t rows, uint32_t position, const ops::StepRows &step) const {
+    const uint64_t stepSlot = decodeArena->gdnTapeSlot(stateLane, states.metadata(stateLane).activeParity ^ 1);
     targetModel->addStateFold(graph,
-                              {decodeArena->get(lane, DecodeTensor::RetainedRows), states.next(stateLane).stateBase,
-                               decodeArena->all(DecodeTensor::GdnTape),
-                               decodeArena->gdnTapeSlot(stateLane, states.metadata(stateLane).activeParity ^ 1), fold},
-                              rows);
+                              {.retainedRows = decodeArena->get(lane, DecodeTensor::RetainedRows),
+                               .laneRows = decodeArena->get(lane, DecodeTensor::LaneLayout),
+                               .state = states.next(stateLane).stateBase,
+                               .gdnTape = decodeArena->all(DecodeTensor::GdnTape),
+                               .stepSlot = stepSlot,
+                               .auxiliaryIn = states.current(stateLane).auxiliary,
+                               .fold = fold.stateBase,
+                               .foldAuxiliary = fold.auxiliary},
+                              rows, step);
     // The window takes the first rows of the lane's retained path, which
     // its capture holds when the lane retained them.
     ops::DraftAttention::addWindowCommit(graph, decodeArena->all(DecodeTensor::ContextHidden),
@@ -3056,8 +3105,9 @@ struct Runtime::Impl {
     encodeDecodeCaptures(graph, entries, items, maximumRetained, step);
   }
 
-  // The embedding of the lanes' first `rows` tokens into `output`'s rows (the
-  // target's hidden rows of a step's rows, or the draft's of its blocks).
+  // The embedding of the lanes' first `rows` tokens into `output`'s rows, the
+  // target's hidden rows of a step's rows (a draft's block rows are its own,
+  // QwenTarget::addDraftEmbedding).
   void encodeBatchEmbedding(CommandGraph &graph, DecodeTensor tokens, const MetalBuffer &output, uint32_t lanes,
                             uint32_t rows) {
     if (!lanes || lanes > kLaneCount)
@@ -3073,11 +3123,13 @@ struct Runtime::Impl {
     const MetalBuffer layout = decodeArena->batchSlice(DecodeTensor::LaneLayout, step.lanes);
     targetModel->addVerifyInput(graph, {decodeArena->batchSlice(DecodeTensor::InputTokens, step.lanes), tree,
                                         layout, step});
-    ops::RoPE::addTreeTables(graph, layout, tree, anchors.first(step.lanes),
-                             prefillArena->get(PrefillTensor::TargetInverseFrequencies),
-                             decodeArena->lanesRows(TargetTensor::RopeCos, step.lanes),
-                             decodeArena->lanesRows(TargetTensor::RopeSin, step.lanes), step,
-                             geometry.target.ropeScaling.attentionFactor(), geometry.target.rotaryPairs);
+    // A target without RoPE builds no target tables.
+    if (geometry.target.rotaryPairs)
+      ops::RoPE::addTreeTables(graph, layout, tree, anchors.first(step.lanes),
+                               prefillArena->get(PrefillTensor::TargetInverseFrequencies),
+                               decodeArena->lanesRows(TargetTensor::RopeCos, step.lanes),
+                               decodeArena->lanesRows(TargetTensor::RopeSin, step.lanes), step,
+                               geometry.target.ropeScaling.attentionFactor(), geometry.target.rotaryPairs);
   }
 
   // A stop token or the last budgeted token needs no target work of its own:
@@ -4134,9 +4186,9 @@ Runtime::decodeAsync(const BatchPlan &plan,
                        width * kDecodeRows, {}, {}, impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
                        impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
   if (impl_->draftModel) {
-    impl_->encodeBatchEmbedding(draft, DecodeTensor::DraftInputTokens,
-                                impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width,
-                                width * kDraftRows);
+    impl_->targetModel->addDraftEmbedding(draft, impl_->decodeArena->batchSlice(DecodeTensor::DraftInputTokens, width),
+                                          impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width),
+                                          width * kDraftRows);
     impl_->draftModel->addMaskRows(draft, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width);
   }
   impl_->encodeDraftBatchGraph(draft, entries, {logicalPositions.data(), width}, {depths.data(), width},
@@ -4904,6 +4956,24 @@ std::span<const uint16_t> RuntimeInstrumentation::lastCapturedRows(const Runtime
   return {contents<uint16_t>(captured, "captured target rows"), captured.sizeBytes() / sizeof(uint16_t)};
 }
 
+// The selector's buffers (Impl::encodeDraftBatchGraph): its candidates and
+// unary scores a lane's positions after another's, its edge tables after the
+// step's shard partials (draft_select_edges), its trees a verify block a lane.
+RuntimeInstrumentation::DraftLattice RuntimeInstrumentation::lastDraftLattice(const Runtime &runtime, uint32_t lane,
+                                                                              uint32_t lanes) {
+  constexpr uint64_t positions = SPLASH_DRAFT_PROPOSAL_TOKENS, candidates = SPLASH_DRAFT_CANDIDATES;
+  if (!lanes || lane >= lanes || lanes > kLaneCount) throw std::invalid_argument("invalid draft lattice lane");
+  const DecodeArena &arena = *runtime.impl_->decodeArena;
+  const uint64_t cells = positions * candidates, table = cells * candidates;
+  const auto *ids = contents<uint32_t>(arena.all(DecodeTensor::Candidates), "draft candidates") + lane * cells;
+  const auto *unary = contents<float>(arena.all(DecodeTensor::Unary), "draft unary scores") + lane * cells;
+  const auto *edges = contents<float>(arena.all(DecodeTensor::TopPartialValues), "draft edges") +
+                      lanes * positions * SPLASH_DRAFT_SAMPLING_SHARDS * candidates + lane * table;
+  const auto *next = contents<float>(arena.all(DecodeTensor::DraftTreeNext), "draft tree next") +
+                     uint64_t{lane} * SPLASH_TARGET_VERIFY_ROWS * candidates;
+  return {{ids, ids + cells}, {unary, unary + cells}, {edges, edges + table}, {next, next + candidates}};
+}
+
 uint32_t RuntimeInstrumentation::lastVerifyRows(const Runtime &runtime, uint32_t lane) {
   return runtime.impl_->laneRows(lane).rows;
 }
@@ -4923,7 +4993,25 @@ void RuntimeInstrumentation::replaceTreeTokens(Runtime &runtime, uint64_t reques
   runtime.impl_->treeTokens[requestId] = std::move(tokens);
 }
 
+void RuntimeInstrumentation::redrawTree(Runtime &runtime, uint64_t requestId, float temperature, uint64_t noise) {
+  if (!(temperature > 0.0F) || !std::isfinite(temperature))
+    throw std::invalid_argument("a redrawn tree's temperature is not positive");
+  runtime.impl_->treeDraws[requestId] = {temperature, noise};
+}
+
 void RuntimeInstrumentation::planBlocks(Runtime &runtime, bool enabled) { runtime.impl_->blockPlans = enabled; }
+
+void RuntimeInstrumentation::replaceCapturedRows(Runtime &runtime, std::span<const uint16_t> rows) {
+  Runtime::Impl &impl = *runtime.impl_;
+  const uint32_t width = impl.geometry.target.capturedHiddenSize();
+  if (rows.size() % width) throw std::invalid_argument("replaced captured rows are not whole rows");
+  impl.replacedCaptures.reset();
+  impl.replacedCaptureRows = static_cast<uint32_t>(rows.size() / width);
+  if (rows.empty()) return;
+  MetalBuffer buffer = impl.backend.allocateBuffer(rows.size_bytes(), BufferStorage::Shared, "replaced captured rows");
+  std::memcpy(contents<uint16_t>(buffer, "replaced captured rows"), rows.data(), rows.size_bytes());
+  impl.replacedCaptures = std::move(buffer);
+}
 
 std::vector<RuntimeInstrumentation::StepChoice> RuntimeInstrumentation::takeStepChoices(Runtime &runtime) {
   return std::exchange(runtime.impl_->stepChoices, {});

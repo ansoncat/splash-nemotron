@@ -1401,9 +1401,8 @@ void ExpertStore::addLoad(metal::CommandGraph &graph, std::span<const ops::MoeLo
     routed = {step.lanes, step.laneRows};
     const Impl::Block &next = impl.blocks[block + 1];
     ops::MoE::addRoutes(graph, step.routerInput ? step.routerInput : step.input, next.router, next.scalarGate,
-                        impl.predictionScores, impl.predictionRoutes, impl.predictionWeights, rows,
-                        predictionShape(next.shape), parts.front().plan->configuration().ggufRouterTile,
-                        next.selectionBias);
+                        next.selectionBias, impl.predictionScores, impl.predictionRoutes, impl.predictionWeights, rows,
+                        predictionShape(next.shape), parts.front().plan->configuration().ggufRouterTile);
   }
   // A cycle's loads keep the GPU awake: a decode step's come about every
   // millisecond and most end within one, about as long as an idle GPU takes

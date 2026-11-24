@@ -27,7 +27,7 @@ NVIDIA Nemotron 3.5 兩顆模型：
 | `nemotron-3.5-bolt` | Bolt 與草稿、看圖（[incoai/splash#633](https://github.com/incoai/splash/issues/633)） |
 | `bolt-streaming` | 在前一個之上：SSD 串流 expert |
 | `bench-tight-memory` | 在前一個之上：`backend-benchmark` 小記憶體暖機 |
-| `super-vl` | 在前一個之上：Super VL、官方 NVFP4 GGUF（NVFP4G64） |
+| `super-vl` | 在前一個之上：Super VL、官方 NVFP4 GGUF（NVFP464） |
 | `nemotron-video` | 在前一個之上：影片輸入與 EVS 修剪 |
 
 `nemotron-3.5-bolt` 到 `nemotron-video` 這五個分支仍基於上游 10-31 的 `main`（1.5.0 之後）。

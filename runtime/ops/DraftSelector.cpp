@@ -36,8 +36,8 @@ DraftSelectorWorkspace DraftSelector::workspace(uint32_t positions) {
 
 void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
                         const DraftCodebooks &codebooks, DraftVocabulary vocabulary,
-                        std::span<const DraftTreeLane> lanes) const {
-  const DraftSelectorBatch batch = requireBuffers(buffers, vocabulary, lanes);
+                        std::span<const DraftTreeLane> lanes, float softcap) const {
+  const DraftSelectorBatch batch = requireBuffers(buffers, vocabulary, lanes, softcap);
   const uint64_t queryRows = uint64_t{batch.params.lanes} * SPLASH_DRAFT_QUERY_ROWS;
   const uint64_t codebook = uint64_t{vocabulary_} * SPLASH_DRAFT_SELECTOR_RANK * 2;
   requireBytes(buffers.selectorHidden, queryRows * SPLASH_DRAFT_SELECTOR_RANK * 2, "draft selector hidden");
@@ -54,9 +54,11 @@ void DraftSelector::add(metal::CommandGraph &graph, const DraftSelectorBuffers &
 }
 
 DraftSelectorBatch DraftSelector::requireBuffers(const DraftSelectorBuffers &buffers, DraftVocabulary vocabulary,
-                                                 std::span<const DraftTreeLane> lanes) const {
+                                                 std::span<const DraftTreeLane> lanes, float softcap) const {
   if (lanes.empty() || lanes.size() > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid draft selector batch");
+  if (!(softcap >= 0.0F && std::isfinite(softcap)))
+    throw std::invalid_argument("invalid draft selector softcap");
   if (vocabulary.leading > vocabulary.trailing || vocabulary.trailing > vocabulary_ || !vocabulary.columns(vocabulary_))
     throw std::invalid_argument("a draft's tokens lie in its vocabulary");
   const uint32_t count = static_cast<uint32_t>(lanes.size());
@@ -70,6 +72,7 @@ DraftSelectorBatch DraftSelector::requireBuffers(const DraftSelectorBuffers &buf
   params.trailing = vocabulary.trailing;
   DraftTreeParams &tree = batch.tree;
   tree.lanes = count;
+  tree.softcap = softcap;
   for (uint32_t lane = 0; lane < count; ++lane) {
     const DraftTreeLane &l = lanes[lane];
     // A tree's rows hold its anchor and every row's path below it, a verify

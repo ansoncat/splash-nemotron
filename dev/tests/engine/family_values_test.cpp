@@ -43,6 +43,8 @@ model::DFlashDraftLayout draftOf(std::string_view family) {
     return test::flashNextDraft();
   if (family == model::FlintLayout{}.family)
     return test::flintDraft();
+  if (family == model::Inkling2LoopLayout{}.family)
+    return test::inkling2Draft();
   if (family == model::NemotronHLayout{}.family)
     return test::nemotronBoltDraft();
   if (family == model::kNemotronSuperLayout.family)

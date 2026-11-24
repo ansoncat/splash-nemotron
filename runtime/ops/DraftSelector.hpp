@@ -144,9 +144,10 @@ public:
   [[nodiscard]] static DraftSelectorWorkspace workspace(uint32_t positions);
 
   // Proposals from `vocabulary`'s tokens, whose logits rows buffers.logits
-  // holds.
+  // holds, each candidate's score after its edge softcapped at `softcap`
+  // (DraftTreeParams; 0: none).
   void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, const DraftCodebooks &codebooks,
-           DraftVocabulary vocabulary, std::span<const DraftTreeLane> lanes) const;
+           DraftVocabulary vocabulary, std::span<const DraftTreeLane> lanes, float softcap = 0.0F) const;
   // After add: the rows of a decode step of `step.lanes` lanes
   // (VerifyRowsParams), the trees' best rows that the step's rows and its
   // lane cap hold, none past an anchor estimated below `floor`, each lane's
@@ -155,9 +156,9 @@ public:
                             float floor = 0.0F);
 
   // add's checks of every buffer but the selector hidden rows and the
-  // codebooks, for a batch of these lanes; returns its params.
+  // codebooks, for a batch of these lanes and that softcap; returns its params.
   [[nodiscard]] DraftSelectorBatch requireBuffers(const DraftSelectorBuffers &buffers, DraftVocabulary vocabulary,
-                                                  std::span<const DraftTreeLane> lanes) const;
+                                                  std::span<const DraftTreeLane> lanes, float softcap = 0.0F) const;
   // add's first and last steps, for a selector that scores the candidates'
   // edges itself (ops::LiLiCorr): each proposal position's shard partials of
   // its sixteen most likely draft tokens; then the trees grown over the edge

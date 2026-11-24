@@ -26,6 +26,9 @@ public:
   // The decode and prefill scratch the constructor allocates.
   [[nodiscard]] static QwenTargetScratchBytes scratchBytes(const QwenTargetGeometry &geometry);
   [[nodiscard]] QwenTargetScratchBytes allocatedScratchBytes() const noexcept override;
+  // Its Mamba-2 state has no fold of a verify's first rows (GDN's), so its
+  // decode captures none (Model::capturesInDecode).
+  [[nodiscard]] bool foldsState() const noexcept override { return false; }
 
   // A prompt chunk's or a decode step's layers (QwenTarget::addPrefillLayers):
   // a decode step's Mamba-2 blocks scan each lane's chain of rows from its

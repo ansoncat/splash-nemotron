@@ -8,6 +8,7 @@
 #include "ops/LiLiCorr.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/Linear.hpp"
+#include "ops/LogitFinish.hpp"
 #include "ops/Normalization.hpp"
 
 #include <cstdint>
@@ -98,8 +99,10 @@ struct DFlashDraftLayout final {
   // A LiLiCorr draft (Bolt's): its selector is a small network over each
   // position's eight best candidates (LiLiCorrWeights) instead of codebooks.
   bool lilicorr = false;
-  // The target layers whose output rows the draft reads, ascending: the
-  // first targetLayerCount of targetLayers, targetHiddenSize() values a row.
+  // The target layer ids whose rows the draft reads, ascending, as its
+  // target's family names them (QwenTargetDimensions::draftReadsLayerInputs):
+  // the first targetLayerCount of targetLayers, targetHiddenSize() values a
+  // row.
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> targetLayers{};
   uint32_t targetLayerCount = 0;
 
@@ -281,12 +284,16 @@ struct DFlashDraftStep final {
 // target's sampling and acceptance policy remain outside the model. Its
 // logits are its target's vocabulary head's, `head`, over the whole
 // vocabulary or over `subset` (QwenTargetDimensions::draftVocabulary), a view
-// of the head's rows that reads that share of its weights.
+// of the head's rows that reads that share of its weights, with the head's
+// finish, `finish` (QwenTargetDimensions::logitFinish): no candidate of the
+// rows past its tokens, which a head padded past them drafts over its whole
+// vocabulary to leave out, and its softcap on each candidate's score after
+// the selector's edge, as DFlash2 trains a draft of a softcapped head.
 class DFlashDraft final {
 public:
   DFlashDraft(const DFlashDraftWeights &weights, metal::MetalBackend &backend,
                const ops::ExecutionPlans &operators, const ops::Projection &head,
-               ops::DraftVocabulary subset);
+               ops::DraftVocabulary subset, ops::LogitFinishValues finish);
 
   // A lane's tokens that choose the vocabulary of its steps: the last of the
   // tokens it read and its anchor (vocabulary).
@@ -374,6 +381,7 @@ private:
   ops::DraftSelector selector_;
   const ops::Projection &head_;
   ops::DraftVocabulary subset_;
+  ops::LogitFinishValues finish_;
   // The head's rows of the subset's tokens.
   ops::Projection subsetHead_;
   // Each layer's key and value rows of its QKV projection, views of its

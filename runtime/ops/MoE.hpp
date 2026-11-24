@@ -5,6 +5,7 @@
 #include "metal/abi/MoE.h"
 #include "ops/LaneRows.hpp"
 #include "ops/Linear.hpp"
+#include "ops/ShortConvolution.hpp"
 
 #include <algorithm>
 #include <array>
@@ -38,7 +39,10 @@ enum class MoeActivation : uint8_t { SwiGlu, ReluSquared };
 // scalar gate or none (MoeShape), the most experts its selection and
 // grouping are compiled for (MoeShape::routerWidth), and their kernels' name
 // suffixes: the selection's, which reads all three, and slicesSuffix of the
-// grouping and the expert passes, which read the slices alone.
+// grouping and the expert passes, which read the slices alone. A biased
+// selection (MoeShape::selectionBias) and a softcapped activation
+// (MoeShape::gateSoftcap, upSoftcap; 0 for SiLU) are a routing's too, the
+// activation's suffix the gate/up pass's.
 struct CompiledMoeRouting final {
   MoeRouter router;
   uint32_t sharedSlices;
@@ -46,16 +50,34 @@ struct CompiledMoeRouting final {
   uint32_t maximumExperts;
   std::string_view selectSuffix;
   std::string_view slicesSuffix;
+  bool selectionBias = false;
+  uint32_t gateSoftcap = 0;
+  uint32_t upSoftcap = 0;
+  std::string_view activationSuffix = "";
 };
 inline constexpr std::array kCompiledMoeRoutings{
     CompiledMoeRouting{MoeRouter::Softmax, 1, true, SPLASH_MOE_WIDE_EXPERT_SLOTS, "", ""},
     // Flint's: a sigmoid router, and an ungated shared expert twice the
     // routed experts' width.
     CompiledMoeRouting{MoeRouter::SigmoidNormalized, 2, false, SPLASH_MOE_EXPERT_SLOTS, "_sigmoid_s2", "_s2"},
+    // A sigmoid router selecting by score plus a per-expert bias, no shared
+    // expert, and SwiGLU softcapped at 4 (gate) and 25 (up).
+    CompiledMoeRouting{MoeRouter::SigmoidNormalized, 0, false, SPLASH_MOE_EXPERT_SLOTS, "_sigmoid_biased_s0", "_s0",
+                       true, 4, 25, "_softcap4_25"},
     // Nemotron-H's: a biased sigmoid router, and no shared expert in the
     // block (the model runs its own).
     CompiledMoeRouting{MoeRouter::SigmoidBiased, 0, false, SPLASH_MOE_WIDE_EXPERT_SLOTS, "_sigmoid_bias_s0", "_s0"},
 };
+
+// A biased selection is the sigmoid router's, of a block without a shared
+// expert (moe_route_select_f32_sigmoid_biased_s0).
+static_assert(std::ranges::all_of(kCompiledMoeRoutings,
+                                  [](const CompiledMoeRouting &compiled) {
+                                    return !compiled.selectionBias ||
+                                           (compiled.router == MoeRouter::SigmoidNormalized &&
+                                            !compiled.sharedSlices && !compiled.sharedGate);
+                                  }),
+              "a biased selection is a sigmoid router's without a shared expert");
 
 // The shared expert is sharedSlices experts every row visits after its
 // routed ones, ids experts to experts + sharedSlices - 1: each has the
@@ -79,23 +101,28 @@ struct MoeShape final {
   // not hiddenSize: Nemotron-H's latent MoE routes its hidden rows and runs
   // the experts on their projection to hiddenSize.
   uint32_t routerInputSize = 0;
-  // A SigmoidBiased router's scale of its routing weights.
-  float routedScale = 1.0f;
-  // Whether every block's experts are resident and in formats the int8
-  // prefill tile takes (moeInt8Experts and RuntimeGeometry::from): its prefill
-  // plans then run the int8 passes and size their scratch
+  // Whether every block's experts are resident and in a routing and formats
+  // the int8 expert passes take (moeInt8Experts and RuntimeGeometry::from):
+  // its prefill plans then run the int8 passes and size their scratch
   // (MoeConfig::int8Passes).
   bool int8Experts = false;
+  // A biased selection ranks the experts by sigmoid(score) plus each one's
+  // bias (BlockMoeWeights::selectionBias) and scales its weights by
+  // routedScale, as a SigmoidBiased router does; it is 1 for every other.
+  bool selectionBias = false;
+  float routedScale = 1.0f;
+  // The softcaps of a SwiGLU's gate factor and up value
+  // (kernels/common/softcapped_swiglu.h); 0 for silu(gate) * up.
+  uint32_t gateSoftcap = 0;
+  uint32_t upSoftcap = 0;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     // Experts of an intermediate width that fills 64-column tiles, and a
-    // routing compiled for the router, shared slices, gate and experts; the
-    // passes without a shared expert run ungated experts alone
-    // (moe_expert_gguf_*_a_s0).
+    // routing compiled for the router, shared slices, gate and experts.
     return hiddenSize && hiddenSize % 256 == 0 && experts && expertsPerToken && expertsPerToken <= experts &&
            expertIntermediateSize && expertIntermediateSize % 64 == 0 && compiledRouting() &&
-           (sharedSlices || activation == MoeActivation::ReluSquared) && routerInput() % 32 == 0 &&
-           (router == MoeRouter::SigmoidBiased ? routedScale > 0 : routedScale == 1.0f);
+           routerInput() % 32 == 0 &&
+           (router == MoeRouter::SigmoidBiased ? routedScale > 0 : selectionBias || routedScale == 1.0f);
   }
   [[nodiscard]] constexpr uint32_t routerInput() const noexcept {
     return routerInputSize ? routerInputSize : hiddenSize;
@@ -105,7 +132,8 @@ struct MoeShape final {
   [[nodiscard]] constexpr const CompiledMoeRouting *compiledRouting() const noexcept {
     for (const CompiledMoeRouting &compiled : kCompiledMoeRoutings)
       if (compiled.router == router && compiled.sharedSlices == sharedSlices && compiled.sharedGate == sharedGate &&
-          experts <= compiled.maximumExperts)
+          compiled.selectionBias == selectionBias && compiled.gateSoftcap == gateSoftcap &&
+          compiled.upSoftcap == upSoftcap && experts <= compiled.maximumExperts)
         return &compiled;
     return nullptr;
   }
@@ -242,7 +270,11 @@ class MoeExpertStream;
 // passes beside the load read (MoeScratch::expertSlots), and the passes after
 // the load read loadSlotTable, the slot of each expert it routed, which its
 // host step writes: no GPU work reads a line of either table while the step
-// runs (metal::EventStep::beside).
+// runs (metal::EventStep::beside). expertScales, F32 [3][experts], holds each
+// routed expert's scale of its gate, up and down products, which the expert
+// passes multiply their fp32 sums by before rounding them (the gate's and up's
+// before the activation): a GGUF's per-expert .scale beside an experts tensor
+// of any format, 1 where the source holds none.
 struct BlockMoeWeights final {
   QuantizedSegment router;           // [experts][routerInput()]
   QuantizedSegment sharedScalarGate; // [1][hidden]
@@ -251,13 +283,14 @@ struct BlockMoeWeights final {
   BlockExpertProjection gate;
   BlockExpertProjection up;
   BlockExpertProjection down;
+  metal::MetalBuffer expertScales;
   metal::MetalBuffer slotTable;
   uint32_t slots = 0;
   const MoeExpertStream *stream = nullptr;
   uint32_t streamBlock = 0;
   metal::MetalBuffer loadSlotTable = {};
   ExpertChunks chunks = {};
-  // A SigmoidBiased router's selection bias, F32 [experts].
+  // A biased selection's or SigmoidBiased router's bias (MoeShape::selectionBias), F32 [experts].
   metal::MetalBuffer selectionBias = {};
 };
 
@@ -387,9 +420,14 @@ inline constexpr auto kMoeWorkspaceFields = [] {
 
 // The tile applies to grouping, gather and the expert passes together;
 // changing it never changes the physical rows in a command. Plans run their
-// passes on M8 tiles, or on M32 tiles where their routes average more than
-// a row per expert (selectMoe).
-enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32 };
+// passes on M8 tiles, on M32 tiles where their routes average more than a row
+// per expert, and on M64 tiles where a prefill chunk's average the device's
+// MoeCalibration::wideTileRoutes (selectMoe), whose passes a routing of one
+// shared slice or none compiles: a plan of two slices (Flint's, whose chunks
+// average at most 48 routes an expert) on M64 tiles throws. A row's bits are
+// the same on every tile: the tiles' 8-, 16-, 32- and 64-row matmuls sum its
+// products in one order (moe_live_rows).
+enum class MoeExpertTile : uint8_t { M8 = 8, M32 = 32, M64 = 64 };
 
 // The device's policy for a MoE plan, which the execution plans derive.
 struct MoeConfig final {
@@ -447,6 +485,35 @@ struct MoeBuffers final {
   metal::MetalBuffer routerInput = {};
 };
 
+// What a MoE block's combine reads (kernels/shared/moe.metal moe_combine):
+// the grouped rows' expert outputs, each route's grouped row and routing
+// weight, and the residual its sums start from, of `params`.
+struct MoeCombine final {
+  metal::MetalBuffer expertOutput;
+  metal::MetalBuffer routeRows;
+  metal::MetalBuffer routingWeights;
+  metal::MetalBuffer residual;
+  MoeCombineParams params{};
+};
+
+// A verify step's short convolution of its combined rows, which its combine
+// runs in its own dispatch (MoE::addCombineConvolution): of static taps
+// along the lanes' trees (`layout`, `rows`, `tree`; each lane's state
+// stateIn[l]), onto buffers.residual, fp32, rounded into buffers.output
+// (ShortConvOutput::RoundedSum), each row's combined input into the tape at
+// the state's columns. The bits the combine into MoeBuffers::output and that
+// convolution of it write, which is then unwritten.
+struct MoeCombineConvolution final {
+  ShortConvBuffers buffers;
+  ShortConvShape shape;
+  std::span<const metal::MetalBuffer> stateIn;
+  ShortConvState state;
+  metal::MetalBuffer layout;
+  LayoutRows rows;
+  metal::MetalBuffer tree;
+  metal::MetalBuffer tape;
+};
+
 // Routes and executes grouped experts from immutable weight views.
 struct MoE final {
   // The plan of a step of 1 to SPLASH_PREFILL_TOKEN_BUDGET rows.
@@ -461,23 +528,38 @@ struct MoE final {
   // chunks, QwenTarget::addPrefillLayers) run their routings, one load of
   // the union beside the first step's resident work, then each step's work
   // through its combine before the next step's: they share the scratch their
-  // gathers and passes write, all but their routing.
+  // gathers and passes write, all but their routing. With `convolution` (a
+  // verify step's) the combine runs it on its rows (MoeCombineConvolution).
   static void addRouting(metal::CommandGraph &graph, const MoeBuffers &buffers,
                          const BlockMoeWeights &weights, const MoePlan &plan);
   static void addResident(metal::CommandGraph &graph, const MoeBuffers &buffers,
                           const BlockMoeWeights &weights, const MoePlan &plan);
   static void addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
-                        const BlockMoeWeights &weights, const MoePlan &plan);
-  // The routing of `rows` rows of `input` by a block's `router` and
-  // `sharedScalarGate` (unread without shape.sharedGate): the router's fp32
+                        const BlockMoeWeights &weights, const MoePlan &plan,
+                        const MoeCombineConvolution *convolution = nullptr);
+  // A combine (`combine`, its rows the step's) running a verify step's
+  // convolution of its rows (`convolution`, ShortConvolution::verifyParams'),
+  // in one dispatch (moe_combine_convolution): the bits the combine into
+  // bf16 rows and then the convolution of them write into
+  // convolution.buffers.output and the tape, a lane's rows (at most
+  // MOE_COMBINE_CONVOLUTION_ROWS) a threadgroup's, which pass their combined
+  // values to the rows that tap them in threadgroup memory;
+  // convolution.buffers.input is unread, and no combined row is written but
+  // the tape's. The channels are the combine's hidden size, a multiple of
+  // MOE_COMBINE_CONVOLUTION_CHANNELS.
+  static void addCombineConvolution(metal::CommandGraph &graph, const MoeCombine &combine,
+                                    const MoeCombineConvolution &convolution);
+  // The routing of `rows` rows of `input` by a block's `router`,
+  // `sharedScalarGate` (unread without shape.sharedGate) and `selectionBias`
+  // (unread without shape.selectionBias or a SigmoidBiased router): the router's fp32
   // scores in `scores` (rows of shape.routerWidth()), then each row's top-k
   // experts and the shared slices with their routing weights in `selected`
-  // and `routingWeights` (shape.routesPerToken() per row). A SigmoidBiased
-  // router reads `selectionBias` (BlockMoeWeights::selectionBias).
+  // and `routingWeights` (shape.routesPerToken() per row).
   static void addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input, const QuantizedSegment &router,
-                        const QuantizedSegment &sharedScalarGate, const metal::MetalBuffer &scores,
+                        const QuantizedSegment &sharedScalarGate, const metal::MetalBuffer &selectionBias,
+                        const metal::MetalBuffer &scores,
                         const metal::MetalBuffer &selected, const metal::MetalBuffer &routingWeights, uint32_t rows,
-                        MoeShape shape, FloatTile routerTile, const metal::MetalBuffer &selectionBias = {});
+                        MoeShape shape, FloatTile routerTile);
   // ReLU^2 in place on `elements` bf16 values (a multiple of 256): the
   // ReluSquared experts' activation, and that of a dense FFN beside them
   // (Nemotron-H's shared expert).
