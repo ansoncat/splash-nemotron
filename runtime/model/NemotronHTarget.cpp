@@ -104,6 +104,7 @@ std::vector<metal::MetalBuffer> NemotronHTarget::addPrefill(metal::CommandGraph 
                                                             QwenPrefillLayers layers, ops::AneFfn *aneFfn) {
   if (spilled.active()) throw std::logic_error("Nemotron-H attends no spilled K/V");
   std::vector<PrefillStep> steps = prefillSteps(graph, chunks, kv, spilled, layers, aneFfn);
+  for (PrefillStep &step : steps) planAttention(step);
   return addPrefillLayers(std::span(steps), *this, layers);
 }
 
