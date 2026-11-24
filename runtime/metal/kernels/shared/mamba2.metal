@@ -245,15 +245,17 @@ template <uint Groups, uint Heads, uint P, uint N, uint ConvDim, uint PackedWidt
 inline void mamba2_decode_batch_phase(
     device const bfloat *packed, device const float *conv_weights, device const float *conv_bias,
     device const uchar *current0, device const uchar *current1, device const uchar *current2,
-    device const uchar *current3, device uchar *next0, device uchar *next1, device uchar *next2,
-    device uchar *next3, device uchar *tape, device const float *a, device const float *dt_bias,
+    device const uchar *current3, device const uchar *current4, device const uchar *current5,
+    device const uchar *current6, device const uchar *current7, device uchar *next0, device uchar *next1,
+    device uchar *next2, device uchar *next3, device uchar *next4, device uchar *next5, device uchar *next6,
+    device uchar *next7, device uchar *tape, device const float *a, device const float *dt_bias,
     device const float *d, device float *y, device const SplashLaneRows *lane_rows,
     constant GDNDecodeBatchParams &params, uint2 group, uint lane, uint simd_group,
     threadgroup Mamba2DecodeShared<P, N> &shared) {
   const uint batch = group.y;
   const SplashLaneRows rows = lane_rows[batch];
-  device const uchar *current = SPLASH_LANE_BINDING(batch, current0, current1, current2, current3);
-  device uchar *next = SPLASH_LANE_BINDING(batch, next0, next1, next2, next3);
+  device const uchar *current = SPLASH_LANE_BINDING(batch, current0, current1, current2, current3, current4, current5, current6, current7);
+  device uchar *next = SPLASH_LANE_BINDING(batch, next0, next1, next2, next3, next4, next5, next6, next7);
   mamba2_decode_step<Groups, Heads, P, N, ConvDim, PackedWidth, ZOffset, XbcOffset, DtOffset>(
       packed + ulong(rows.first) * PackedWidth, conv_weights, conv_bias,
       reinterpret_cast<device const bfloat *>(current + ulong(params.layer) * params.conv_layer_bytes),
@@ -271,18 +273,23 @@ inline void mamba2_decode_batch_phase(
   kernel void Name(device const bfloat *packed [[buffer(0)]], device const float *conv_weights [[buffer(1)]],  \
                    device const float *conv_bias [[buffer(2)]], device const uchar *current0 [[buffer(3)]],    \
                    device const uchar *current1 [[buffer(4)]], device const uchar *current2 [[buffer(5)]],     \
-                   device const uchar *current3 [[buffer(6)]], device uchar *next0 [[buffer(7)]],              \
-                   device uchar *next1 [[buffer(8)]], device uchar *next2 [[buffer(9)]],                       \
-                   device uchar *next3 [[buffer(10)]], device uchar *tape [[buffer(11)]],                      \
-                   device const float *a [[buffer(12)]], device const float *dt_bias [[buffer(13)]],           \
-                   device const float *d [[buffer(14)]], device float *y [[buffer(15)]],                       \
-                   device const SplashLaneRows *lane_rows [[buffer(16)]],                                      \
-                   constant GDNDecodeBatchParams &params [[buffer(17)]],                                       \
+                   device const uchar *current3 [[buffer(6)]], device const uchar *current4 [[buffer(7)]],     \
+                   device const uchar *current5 [[buffer(8)]], device const uchar *current6 [[buffer(9)]],     \
+                   device const uchar *current7 [[buffer(10)]], device uchar *next0 [[buffer(11)]],            \
+                   device uchar *next1 [[buffer(12)]], device uchar *next2 [[buffer(13)]],                     \
+                   device uchar *next3 [[buffer(14)]], device uchar *next4 [[buffer(15)]],                     \
+                   device uchar *next5 [[buffer(16)]], device uchar *next6 [[buffer(17)]],                     \
+                   device uchar *next7 [[buffer(18)]], device uchar *tape [[buffer(19)]],                      \
+                   device const float *a [[buffer(20)]], device const float *dt_bias [[buffer(21)]],           \
+                   device const float *d [[buffer(22)]], device float *y [[buffer(23)]],                       \
+                   device const SplashLaneRows *lane_rows [[buffer(24)]],                                      \
+                   constant GDNDecodeBatchParams &params [[buffer(25)]],                                       \
                    uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],      \
                    uint simd_group [[simdgroup_index_in_threadgroup]]) {                                       \
     threadgroup Mamba2DecodeShared<P, N> shared;                                                               \
     mamba2_decode_batch_phase<Groups, Heads, P, N, ConvDim, PackedWidth, ZOffset, XbcOffset, DtOffset>(        \
-        packed, conv_weights, conv_bias, current0, current1, current2, current3, next0, next1, next2, next3,   \
+        packed, conv_weights, conv_bias, current0, current1, current2, current3, current4, current5, current6,   \
+        current7, next0, next1, next2, next3, next4, next5, next6, next7,                                     \
         tape, a, dt_bias, d, y, lane_rows, params, group, lane, simd_group, shared);                                      \
   }
 

@@ -1,5 +1,6 @@
-// vision_attention and vision_attention_d80 (kernels/shared/vision.metal),
-// Qwen3.5's heads of 72 and RADIO's of 80, against an fp64 reference, row by
+// vision_attention_d80 (kernels/shared/vision.metal), RADIO's heads of 80
+// (Qwen3.5's tower runs the shared dense attention), against an fp64
+// reference, row by
 // row. Token counts fall below, on and past its 32-row query tile and
 // 128-key tile, up to 4,100 (33 key tiles, the last of four keys), and each
 // runs three kinds of input: random queries, keys and values; keys whose
@@ -55,8 +56,7 @@ struct Geometry final {
   uint32_t headDimension;
   uint32_t qkDimension;
 };
-constexpr Geometry kGeometries[] = {{"vision_attention", kTower.headDimension, 80},
-                                    {"vision_attention_d80", splash::ops::kRadioVisionLayout.headDimension, 80}};
+constexpr Geometry kGeometries[] = {{"vision_attention_d80", splash::ops::kRadioVisionLayout.headDimension, 80}};
 constexpr uint32_t kKeyTile = 128;
 constexpr uint16_t kNan = 0x7FC0;
 

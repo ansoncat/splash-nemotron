@@ -155,6 +155,10 @@ QwenTargetGeometry qwenTargetGeometry(const NemotronHWeights &weights, std::span
   geometry.moeRouterFormat = ops::moeRouterFormat(moeBlocks);
   geometry.prefillProjections = geometry.decodeProjections;
   geometry.include(weights.logitsProjection);
+  // The draft's head over its subset of the vocabulary (QwenTargetGeometry::finish).
+  ops::ProjectionShape subset = weights.logitsProjection.shape();
+  subset.outputSize = geometry.draftVocabulary.columns(geometry.vocabularySize);
+  geometry.decodeProjections.push_back(subset);
   for (auto *shapes : {&geometry.prefillProjections, &geometry.decodeProjections}) {
     std::sort(shapes->begin(), shapes->end());
     shapes->erase(std::unique(shapes->begin(), shapes->end()), shapes->end());

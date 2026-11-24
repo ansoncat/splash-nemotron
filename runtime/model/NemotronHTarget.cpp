@@ -1,6 +1,7 @@
 #include "model/NemotronHTarget.hpp"
 
 #include "model/ExpertStore.hpp"
+#include "ops/AneFfn.hpp"
 #include "ops/Mamba2.hpp"
 #include "ops/MoE.hpp"
 #include "ops/Normalization.hpp"
@@ -16,7 +17,7 @@ namespace {
 
 constexpr uint32_t kVerifyRows = ExecutionLimits::targetVerifyRows;
 // A full batch's verify rows, which the decode scratch holds (a step's storage
-// lanes are at most a batch's, QwenTarget::decodeStorageLanes).
+// lanes are at most a batch's, model::draftStepLanes).
 constexpr uint64_t kScratchRows = uint64_t{ExecutionLimits::maximumBatchWidth} * kVerifyRows;
 // A prefill chunk's rows and the two slices a sequence's Mamba-2 rows run
 // past its last row: the last slice's and the fold's (addPrefillMamba).
@@ -155,7 +156,7 @@ void NemotronHTarget::addPrefillExperts(PrefillStep &step, uint32_t index) const
 metal::MetalBuffer NemotronHTarget::addPrefillEnd(PrefillStep &step) const {
   const metal::MetalBuffer hidden = step.buffers.hidden[geometry_.layers & 1];
   if (const QwenTargetDecodeBuffers *d = step.decode)
-    addNormalizedHead(step.graph, weights_.finalNorm, hidden, d->finalHidden, d->logits, step.rows,
+    addNormalizedHead(step.graph, linear(step), weights_.finalNorm, hidden, d->finalHidden, d->logits, step.rows,
                       step.buffers.linearScratch);
   return hidden;
 }
@@ -267,7 +268,8 @@ void NemotronHTarget::addBlock(PrefillStep &step, const NemotronMoeWeights &bloc
   const QwenTargetPrefillBuffers &b = step.buffers;
   const Rows &r = rows(step);
   addProjection(step, block.latentDown, b.normalized, r.latent);
-  step.moe = operators_.moe(block.shape, geometry_.moeRouterFormat, step.rows);
+  step.moe = operators_.moe(block.shape, geometry_.moeRouterFormat, step.rows,
+                            step.decode ? ops::StepKind::Decode : ops::StepKind::Prefill);
   step.ffn = {.input = r.latent, .output = r.moeLatent, .scratch = b.moe, .routerInput = b.normalized};
   if (const QwenTargetDecodeBuffers *d = step.decode) {
     step.ffn.lanes = d->step.lanes;
@@ -282,7 +284,7 @@ void NemotronHTarget::addBlock(PrefillStep &step, const NemotronMoeWeights &bloc
 void NemotronHTarget::addHeadBatch(metal::CommandGraph &graph, metal::MetalBuffer hidden,
                                    metal::MetalBuffer finalHidden, metal::MetalBuffer logits, uint32_t rows,
                                    ops::LinearScratch scratch) const {
-  addNormalizedHead(graph, weights_.finalNorm, std::move(hidden), std::move(finalHidden), std::move(logits), rows,
+  addNormalizedHead(graph, operators_.linear(), weights_.finalNorm, std::move(hidden), std::move(finalHidden), std::move(logits), rows,
                     scratch);
 }
 

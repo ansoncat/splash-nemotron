@@ -162,7 +162,8 @@ void printUsage(std::string_view executable) {
       " [--expert-memory BYTES|auto|off] [--sparse-kv-memory BYTES|auto]"
       " [--host-reserve BYTES|auto]"
       " [--kv-spill always] [--kv-window-trim on|off] [--verify-rows auto|all]"
-      " [--control-vector PATH] [--control-vector-layers FIRST-LAST]");
+      " [--control-vector PATH] [--control-vector-layers FIRST-LAST]"
+      " [--max-concurrent-requests REQUESTS]");
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_HEADERS [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " device-check");
@@ -240,6 +241,7 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.maximumImagePatches = arguments.maxImagePatches;
   config.resources.idleReleaseSeconds = arguments.idleReleaseSeconds;
   config.resources.aneFfn.enabled = arguments.neuralEngine;
+  config.resources.aneFfn.recalibrate = arguments.recalibrateAne;
   config.resources.relaunchContext = arguments.relaunchContext;
   config.resources.pleMemory = arguments.pleMemory;
   config.resources.expertMemory = arguments.expertMemory;
@@ -249,6 +251,7 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.kvWindowTrim = arguments.kvWindowTrim;
   config.resources.verifyRows = arguments.verifyRows;
   config.resources.controlVector = arguments.controlVector;
+  config.resources.lanes = arguments.lanes;
   config.resources.int8Activations = arguments.int8Activations;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;

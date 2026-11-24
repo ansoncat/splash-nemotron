@@ -367,7 +367,7 @@ LaneReference reference(const LiLiCorrWeights &w, const EmbeddingWeights &embedd
 // Everything one selection binds.
 struct Fixture final {
   Fixture(MetalBackend &backend, uint32_t lanes, uint64_t seed)
-      : lanes(lanes), random(seed), linear(backend.capabilities(), Int8Activations::Off), selector(kVocabulary) {
+      : lanes(lanes), random(seed), linear(backend.capabilities(), Int8Activations::Off, StepKind::Prefill), selector(kVocabulary) {
     Weights weights(backend, seed * 31 + 7);
     w = weights.lilicorr();
     embedding = EmbeddingWeights(kVocabulary, kHidden,

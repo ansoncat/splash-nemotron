@@ -2,6 +2,8 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
+#include "ops/DenseLinear.hpp"
+#include "ops/Normalization.hpp"
 
 #include <cstdint>
 #include <vector>
@@ -50,23 +52,19 @@ inline constexpr VisionLayout kRadioVisionLayout{
   return layout == kRadioVisionLayout;
 }
 
-struct VisionAffine final {
-  metal::MetalBuffer weight;
-  metal::MetalBuffer bias;
-};
-
-struct VisionNorm final {
-  metal::MetalBuffer weight;
-  metal::MetalBuffer bias;
-};
+// The Nemotron fork's names for the shared dense weights (DenseLinear.hpp,
+// Normalization.hpp), which RADIO's own kernels read; its bias-free ones
+// leave the bias empty.
+using VisionAffine = DenseWeights;
+using VisionNorm = LayerNormWeights;
 
 struct VisionBlock final {
-  VisionNorm norm1;
-  VisionAffine qkv;
-  VisionAffine projection;
-  VisionNorm norm2;
-  VisionAffine upProjection;
-  VisionAffine downProjection;
+  LayerNormWeights norm1;
+  DenseWeights qkv;
+  DenseWeights projection;
+  LayerNormWeights norm2;
+  DenseWeights upProjection;
+  DenseWeights downProjection;
 };
 
 // bf16 weights. RADIO's patch embedding and merger have no biases (their bias
@@ -74,7 +72,7 @@ struct VisionBlock final {
 // (mergerNorm.weight, no bias).
 struct VisionWeights final {
   VisionLayout layout;
-  VisionAffine patchEmbedding;
+  DenseWeights patchEmbedding;
   metal::MetalBuffer positionTable;
   std::vector<VisionBlock> blocks;
   VisionNorm mergerNorm;
@@ -121,16 +119,20 @@ struct ImageGrid final {
 
 // GPU vision encoder with one reusable scratch arena sized for maximumPatches.
 // encode() appends one image's dispatches, from resized uint8 RGB pixels to
-// bf16 language embeddings in the caller's buffer, so the arena can be
-// released after encoding while later chunks copy the image's rows into their
-// hidden rows (ops::RowCopy).
+// bf16 language embeddings in the caller's buffer, a row of
+// layout.outputHiddenSize per merged token, so the arena can be released
+// after encoding while later chunks copy the image's rows into their hidden
+// rows (ops::RowCopy). The tower's projections, LayerNorms and attention are
+// the shared dense operators (ops/DenseLinear.hpp, ops/Normalization.hpp,
+// ops/DenseAttention.hpp).
 class Vision final {
 public:
   // Scratch footprint before construction, so the caller can reserve it.
   [[nodiscard]] static uint64_t
   scratchBytes(const VisionLayout &layout, uint32_t maximumPatches);
-  // Embedding buffers are written in whole merger tiles: the caller allocates
-  // this many rows of layout.outputHiddenSize bf16 values per image.
+  // Embedding buffers are written in whole merger tiles (RADIO's GEMMs write
+  // whole 32-row tiles): the caller allocates this many rows of
+  // layout.outputHiddenSize bf16 values per image.
   [[nodiscard]] static uint32_t embeddingRows(ImageGrid grid) noexcept;
 
   // Throws unless `model` holds every weight of the tower its layout names.
@@ -163,7 +165,7 @@ private:
     Queries,
     Keys,
     Values,
-    Attention,
+    Attention, // RADIO's vision_attention_d80 output, before its gather
     Context,
     Count,
   };
@@ -171,6 +173,9 @@ private:
   [[nodiscard]] const metal::MetalBuffer &scratch(Scratch tensor) const noexcept {
     return scratch_[static_cast<uint32_t>(tensor)];
   }
+  // RADIO's encoder on the Nemotron fork's own kernels (Vision.cpp).
+  void encodeRadio(metal::CommandGraph &graph, ImageGrid grid, const metal::MetalBuffer &pixels,
+                   const metal::MetalBuffer &embeddings) const;
   void addGemm(metal::CommandGraph &graph, const char *pipeline,
                const metal::MetalBuffer &input,
                const VisionAffine &weights,
@@ -185,6 +190,7 @@ private:
   const VisionWeights &model_;
   uint32_t maximumPatches_ = 0;
   bool radio_ = false;
+  DenseLinear dense_;
   metal::MetalBuffer arena_;
   // The bias of RADIO's bias-free GEMMs, zero for the widest of them: the
   // arena's end, which scratchBytes counts.

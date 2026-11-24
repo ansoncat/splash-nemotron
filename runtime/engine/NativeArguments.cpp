@@ -188,6 +188,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (value != "on" && value != "off")
         throw UsageError("--ane requires on or off");
       result.neuralEngine = value == "on";
+    } else if (option == "--ane-calibration") {
+      if (value != "again")
+        throw UsageError("--ane-calibration requires again");
+      result.recalibrateAne = true;
     } else if (option == "--activations") {
       if (value != "auto" && value != "bf16")
         throw UsageError("--activations requires auto or bf16");
@@ -210,6 +214,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
       if (dash == std::string_view::npos || !read(value.substr(0, dash), first) ||
           !read(value.substr(dash + 1), last) || first > last)
         throw UsageError("--control-vector-layers requires FIRST-LAST");
+    } else if (option == "--max-concurrent-requests") {
+      if (!parsePositive(value, result.lanes) || result.lanes > model::ExecutionLimits::maximumBatchWidth)
+        throw UsageError("--max-concurrent-requests requires an integer in [1, " +
+                         std::to_string(model::ExecutionLimits::maximumBatchWidth) + "]");
     } else if (option == "--relaunch-context") {
       relaunchContext = value;
     } else {

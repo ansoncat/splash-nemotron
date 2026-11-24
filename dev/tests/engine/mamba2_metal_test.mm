@@ -15,6 +15,7 @@
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/GDN.h"
 #include "metal/abi/Mamba2.h"
+#include "ops/LaneBindings.hpp"
 #include "ops/Mamba2.hpp"
 
 #include <array>
@@ -225,10 +226,7 @@ struct Fixture {
       tapes[l] = {slot(pendingSlots[l]), slot(stepSlots[l]), (1u << pendingRows[l]) - 1u};
     const MetalBuffer laneRows = test::sharedBuffer(backend, kLanes * sizeof(SplashLaneRows));
     std::memcpy(laneRows.contents(), this->laneRows.data(), sizeof(this->laneRows));
-    const auto lanes = [](const std::vector<MetalBuffer> &v) {
-      return std::vector<MetalBuffer>{v[0], v[1], v[0], v[0]};
-    };
-    const std::vector<MetalBuffer> currentLanes = lanes(current), nextLanes = lanes(next);
+    const auto currentLanes = ops::laneBindings(current), nextLanes = ops::laneBindings(next);
     CommandGraph graph;
     uint32_t rows = 0;
     for (const SplashLaneRows &lane : this->laneRows) rows = std::max(rows, lane.first + lane.rows);

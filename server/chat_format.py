@@ -128,6 +128,14 @@ class ChatFormat:
     # The template's special token after which prompt tokenization reuses a
     # cached prompt's tokens (tokenization.PromptTokenizer).
     message_boundary: str
+    # The texts that open a message of a role outside a prompt's head, as the
+    # template writes them, one for each role that follows it: the user's,
+    # the assistant's and a tool result's. The head is the system or
+    # developer messages and the tools a template renders at the prompt's
+    # start, which other conversations of the same agent or app share,
+    # however many blocks it renders them in; it ends where the first of
+    # these begins (frontend._head_tokens).
+    turn_openings: tuple[str, ...]
     # The template's placeholder for one image, one token, which the server
     # widens to the image's tokens, between image_open and image_close where
     # the family's processor wraps them; None for a template without one.
@@ -174,6 +182,8 @@ QWEN = ChatFormat(
     call_open_id=248058,
     call_syntax=QWEN_XML,
     message_boundary="<|im_end|>",
+    # A tool result is a user turn.
+    turn_openings=("<|im_start|>user", "<|im_start|>assistant"),
     image_pad="<|image_pad|>",
 )
 # Flint's: <|end_of_text|> and the role tokens <|user|>, <|observation|> and
@@ -187,6 +197,7 @@ FLINT = ChatFormat(
     call_open_id=150010,
     call_syntax=GLM_ARGS,
     message_boundary="<|assistant|>",
+    turn_openings=("<|user|>", "<|assistant|>", "<|observation|>"),
     image_pad=None,
 )
 # Nemotron-H's (Nemotron 3.5 Bolt, runtime/model/NemotronH.hpp): </s>
@@ -203,6 +214,8 @@ NEMOTRON = ChatFormat(
     call_open_id=14,
     call_syntax=QWEN_XML,
     message_boundary="<|im_end|>",
+    # A tool result is a user turn, as Qwen's.
+    turn_openings=("<|im_start|>user", "<|im_start|>assistant"),
     image_pad="<image>",
     image_open="<img>",
     image_close="</img>",

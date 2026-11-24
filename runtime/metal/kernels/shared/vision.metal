@@ -1,19 +1,23 @@
-// Vision encoder kernels for the Qwen3.5 vision tower: pixel patchify,
-// position/rope preparation, dense bf16 GEMMs with fused epilogues,
-// LayerNorm, 2D-rope QKV preparation and non-causal flash attention; and the
-// kernels Nemotron 3.5 Bolt's RADIO tower runs in their place (_radio, _d80).
+// The Qwen3.5 vision tower's own kernels (ops/Vision.cpp): pixel patchify,
+// position and rope preparation, and 2D-rope QKV preparation into the
+// per-head layout the dense attention reads (shared/dense_attention.metal);
+// the tower's projections, LayerNorms and attention are the shared dense
+// operators. 256 threads (8 simdgroups) per threadgroup. Attention runs on
+// the native head dimension (72); token counts are padded to the 128-key
+// tile so K/V tiles read in full, with padded keys zeroed and masked by the
+// softmax.
 //
-// Conventions match the text-model kernels: 256 threads (8 simdgroups) per
-// threadgroup (128 for attention), MPP cooperative-tensor matmuls with fp32
-// accumulation and hand-written epilogues, grid {row_tile, output_tile}.
-// Attention runs on the native head dimension (72); token counts are padded
-// to the 128-key tile so K/V tiles read in full, with padded keys zeroed and
-// masked by the softmax.
+// Nemotron 3.5 Bolt's RADIO tower keeps the Nemotron fork's own kernels
+// (_radio, _d80): dense bf16 GEMMs with fused epilogues (MPP cooperative-
+// tensor matmuls, fp32 accumulation), LayerNorm, RMS norm and non-causal
+// flash attention at head dimension 80, 128 threads per attention
+// threadgroup; and the EVS video pruning kernels.
 //
 // Token order everywhere is spatial-merge-block-major: each consecutive group
 // of four patches is one 2x2 spatial unit, so the merger reads contiguous
 // rows and the merged token index is row-major over the merged grid.
 
+#include "metal/abi/DenseAttention.h"
 #include "metal/abi/Vision.h"
 #include <metal_stdlib>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -23,9 +27,8 @@ using namespace mpp::tensor_ops;
 
 constant ushort kVisionHeads = 16;
 constant ushort kVisionHeadDim = 72;
-// Q/K are stored padded to 80 dims (matmul K extents must be multiples of
-// 16); the zeroed tail contributes nothing to the dot products.
-constant ushort kVisionQkDim = 80;
+// Q/K are stored padded as the dense attention reads them (80 dimensions).
+constant ushort kVisionQkDim = splash_dense_attention_padded(kVisionHeadDim);
 constant ushort kVisionHidden = 1152;
 constant ushort kVisionPatch = 16;
 constant ushort kVisionMerge = 2;
@@ -144,14 +147,6 @@ kernel void vision_prepare_positions(
     uint thread_index [[thread_index_in_threadgroup]])
 {
     device float *out = hidden + ulong(token) * kVisionHidden;
-    // The padding rows of the last GEMM tile start each image from zero: the
-    // residual GEMMs add to these rows in place, and the constructor's memset
-    // clears them only before the first image.
-    if (token >= params.grid_height * params.grid_width) {
-        for (uint dim = thread_index; dim < kVisionHidden; dim += 256)
-            out[dim] = 0.0f;
-        return;
-    }
     uint2 position = vision_patch_position(token, params.grid_width);
     uint row_taps[2], col_taps[2];
     float row_weights[2], col_weights[2];
@@ -715,10 +710,6 @@ kernel void vision_attention(
 }
 
 // Qwen3.5's heads of 72 (Q and K padded to 80) and RADIO's of 80.
-template [[host_name("vision_attention")]] kernel void
-vision_attention<kVisionHeadDim, kVisionQkDim>(
-    device bfloat *, device bfloat *, device bfloat *, device bfloat *,
-    constant VisionAttentionParams &, uint2, uint);
 template [[host_name("vision_attention_d80")]] kernel void
 vision_attention<kRadioHeadDim, kRadioHeadDim>(
     device bfloat *, device bfloat *, device bfloat *, device bfloat *,
@@ -744,9 +735,6 @@ kernel void vision_attention_gather(
     }
 }
 
-template [[host_name("vision_attention_gather")]] kernel void
-vision_attention_gather<kVisionHidden, kVisionHeadDim>(
-    device const bfloat *, device bfloat *, constant VisionQkvParams &, uint, uint);
 template [[host_name("vision_attention_gather_d80")]] kernel void
 vision_attention_gather<kRadioHidden, kRadioHeadDim>(
     device const bfloat *, device bfloat *, constant VisionQkvParams &, uint, uint);

@@ -30,6 +30,8 @@
 namespace {
 
 using namespace splash;
+using ops::DenseWeights;
+using ops::LayerNormWeights;
 using ops::VisionAffine;
 using ops::VisionBlock;
 using ops::VisionNorm;
@@ -49,7 +51,7 @@ void run(metal::MetalBackend &backend, const ops::VisionLayout &layout, bool rad
                          intermediate * merged * kBf16Bytes, positions * kBf16Bytes}));
   const auto tensor = [&](uint64_t elements) { return backend.view(storage, 0, elements * kBf16Bytes); };
   const auto affine = [&](uint64_t output, uint64_t input) {
-    return VisionAffine{tensor(output * input), tensor(output)};
+    return DenseWeights{tensor(output * input), tensor(output)};
   };
   const auto unbiased = [&](uint64_t output, uint64_t input) { return VisionAffine{tensor(output * input), {}}; };
   const VisionNorm norm{tensor(hidden), tensor(hidden)};
@@ -67,8 +69,10 @@ void run(metal::MetalBackend &backend, const ops::VisionLayout &layout, bool rad
                                      : affine(layout.outputHiddenSize, intermediate);
   if (radio) model.prefixTokens = tensor(uint64_t{layout.prefixTokens} * hidden);
   const metal::MetalBuffer pixels = test::sharedBuffer(backend, kGrid.pixelBytes());
-  const metal::MetalBuffer embeddings = test::sharedBuffer(
-      backend, uint64_t{ops::Vision::embeddingRows(kGrid)} * layout.outputHiddenSize * kBf16Bytes);
+  // RADIO's merger writes whole row tiles (Vision::embeddingRows); the Qwen tower writes its merged rows alone.
+  const uint64_t embeddingRows = radio ? ops::Vision::embeddingRows(kGrid) : kGrid.mergedTokens();
+  const metal::MetalBuffer embeddings =
+      test::sharedBuffer(backend, embeddingRows * layout.outputHiddenSize * kBf16Bytes);
   const auto encode = [&](metal::CommandGraph &graph, const VisionWeights &weights, const metal::MetalBuffer &image,
                           const metal::MetalBuffer &output) {
     const ops::Vision vision(backend, weights, kGrid.patches());
@@ -86,7 +90,7 @@ void run(metal::MetalBackend &backend, const ops::VisionLayout &layout, bool rad
                     encode(graph, changed, pixels, embeddings);
                   });
   };
-  const auto requireAffineExtent = [&](VisionAffine VisionWeights::*member, uint64_t output, uint64_t input,
+  const auto requireAffineExtent = [&](DenseWeights VisionWeights::*member, uint64_t output, uint64_t input,
                                        const std::string &name) {
     requireWeightExtent((model.*member).weight, output * input, name + " weight",
                         [&](VisionWeights &changed, const metal::MetalBuffer &view) { (changed.*member).weight = view; });
@@ -104,7 +108,8 @@ void run(metal::MetalBackend &backend, const ops::VisionLayout &layout, bool rad
         [](VisionWeights &changed, const metal::MetalBuffer &view) { changed.prefixTokens = view; });
   for (const auto &[member, name] : {std::pair{&VisionBlock::norm1, "vision attention norm"},
                                      std::pair{&VisionBlock::norm2, "vision MLP norm"}})
-    for (const auto &[field, part] : {std::pair{&VisionNorm::weight, " weight"}, std::pair{&VisionNorm::bias, " bias"}})
+    for (const auto &[field, part] : {std::pair{&LayerNormWeights::weight, " weight"},
+                                      std::pair{&LayerNormWeights::bias, " bias"}})
       requireWeightExtent(model.blocks.back().*member.*field, hidden, std::string(name) + part,
                           [&](VisionWeights &changed, const metal::MetalBuffer &view) {
                             changed.blocks.back().*member.*field = view;
@@ -116,7 +121,7 @@ void run(metal::MetalBackend &backend, const ops::VisionLayout &layout, bool rad
         std::tuple{&VisionBlock::downProjection, hidden, uint64_t{layout.paddedIntermediateSize},
                    "vision down projection"}})
     for (const auto &[field, part, elements] :
-         {std::tuple{&VisionAffine::weight, " weight", output * input}, std::tuple{&VisionAffine::bias, " bias", output}})
+         {std::tuple{&DenseWeights::weight, " weight", output * input}, std::tuple{&DenseWeights::bias, " bias", output}})
       requireWeightExtent(model.blocks.back().*member.*field, elements, std::string(name) + part,
                           [&](VisionWeights &changed, const metal::MetalBuffer &view) {
                             changed.blocks.back().*member.*field = view;
