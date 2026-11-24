@@ -302,6 +302,9 @@ void QwenTarget::addPrefillMixer(PrefillStep &step, const QwenAttentionWeights &
   const ops::Linear &linear = this->linear(step);
   const uint32_t layer = step.attentionLayer++;
   const ops::AttentionVariant variant = geometry_.attentionVariant(layer);
+  // Each target's addPrefill plans its steps' attention (planAttention).
+  if (!step.attention || (variant.windowTokens && !step.windowedAttention))
+    throw std::logic_error("a Qwen prefill step's attention is not planned");
   if (!blocks.empty() && blocks.size() != step.sequences.size())
     throw std::invalid_argument("Qwen attention blocks do not match its sequences");
   // A layer that outputs its read rows alone adds its output to their
