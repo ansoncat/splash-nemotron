@@ -163,7 +163,7 @@ metal::MetalBuffer NemotronHTarget::addPrefillEnd(PrefillStep &step) const {
 
 void NemotronHTarget::addProjection(PrefillStep &step, const ops::Projection &projection, metal::MetalBuffer input,
                                     metal::MetalBuffer output, metal::MetalBuffer residual) const {
-  const ops::Linear &linear = operators_.linear();
+  const ops::Linear &linear = this->linear(step);
   const ops::LinearPlan plan =
       linear.plan(projection, step.rows, residual ? ops::LinearEpilogue::Residual : ops::LinearEpilogue::None);
   linear.add(step.graph,

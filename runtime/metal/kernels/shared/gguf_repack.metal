@@ -280,6 +280,7 @@ kernel void moe_expert_load(device const uchar *staging [[buffer(0)]], device co
                             constant ulong *chunks [[buffer(4)]], uint3 group [[threadgroup_position_in_grid]],
                             uint index [[thread_index_in_threadgroup]]) {
   constant MoeExpertLoadProjection &q = p.projections[group.z];
+  if (!q.rows) return; // An ungated expert's empty gate: no spans to divide by.
   const uint G = q.columns / 32, spans = (G + MOE_EXPERT_LOAD_SPAN - 1) / MOE_EXPERT_LOAD_SPAN;
   const uint n = group.x / spans * QUANT_TILE_ROWS + index % QUANT_TILE_ROWS;
   const uint first = group.x % spans * MOE_EXPERT_LOAD_SPAN, end = min(G, first + MOE_EXPERT_LOAD_SPAN);

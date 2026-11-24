@@ -777,7 +777,7 @@ struct Runtime::Impl {
     // computes of them, which no row takes, is finite.
     if (!draftModel)
       for (const DecodeTensor tensor : {DecodeTensor::Candidates, DecodeTensor::Unary, DecodeTensor::TopPartialValues}) {
-        const MetalBuffer table = decodeArena->batchSlice(tensor, kLaneCount);
+        const MetalBuffer table = decodeArena->all(tensor);
         std::memset(table.contents(), 0, table.sizeBytes());
       }
     penaltyTable =
