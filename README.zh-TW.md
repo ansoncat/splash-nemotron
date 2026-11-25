@@ -13,14 +13,16 @@ NVIDIA Nemotron 3.5 兩顆模型：
 另外 Qwen3.8-Flash-Next 可以投影掉 control vector（[下面](#flash-next-control-vector)），只在 `nemotron`，不打算送上游。
 
 其餘功能和上游相同；上游的使用說明見 [README.md](README.md)。`nemotron` 已合併上游
-1.7.0。上游的桌面 App 和 Homebrew 版不含這些改動，請用下面 fork 的預先編譯版，或從原始碼編譯。
+1.7.3。上游的桌面 App 和 Homebrew 版不含這些改動，請用下面 fork 的預先編譯版，或從原始碼編譯。
 
 ## 分支
 
 | 分支 | 內容 |
 | --- | --- |
-| `nemotron`（預設） | 全部改動＋README，已合併上游 1.7.0 |
-| `nemotron-1.7` | 上游 1.7.0 的合併，單獨留一個分支 |
+| `nemotron`（預設） | 全部改動＋README，已合併上游 1.7.3 |
+| `nemotron-1.7.3` | 上游 1.7.3 的合併，單獨留一個分支 |
+| `nemotron-1.7.2` | 先前上游 1.7.2 的合併 |
+| `nemotron-1.7` | 先前上游 1.7.0 的合併 |
 | `nemotron-1.6.1` | 先前上游 1.6.1 的合併 |
 | `nemotron-1.6` | 先前上游 1.6.0 的合併 |
 | `main` | 只追上游，不改 |
@@ -34,12 +36,12 @@ NVIDIA Nemotron 3.5 兩顆模型：
 
 ## 安裝預先編譯版
 
-[1.6.0-nemotron.1](https://github.com/ansoncat/splash-nemotron/releases/tag/1.6.0-nemotron.1)（仍是 1.6.0 版）：
+[1.7.3-nemotron.1](https://github.com/ansoncat/splash-nemotron/releases/tag/1.7.3-nemotron.1)：
 Apple silicon、macOS 26.4 以上，沒有簽章。裝成 `splash-nemotron` 指令（在 `~/.local`），不會蓋掉
 Homebrew 的 `splash`。
 
 ```bash
-curl -fsSL https://github.com/ansoncat/splash-nemotron/releases/download/1.6.0-nemotron.1/install.sh | sh
+curl -fsSL https://github.com/ansoncat/splash-nemotron/releases/download/1.7.3-nemotron.1/install.sh | sh
 splash-nemotron serve --model nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF
 ```
 

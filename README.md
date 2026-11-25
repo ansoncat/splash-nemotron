@@ -15,9 +15,10 @@
 > Everything else is upstream. 中文說明：[README.zh-TW.md](README.zh-TW.md).
 >
 > - `nemotron` (this default branch): all of the fork's changes, merged with
->   upstream's 1.7.0.
-> - `nemotron-1.7`: that merge as its own branch; `nemotron-1.6.1` and
->   `nemotron-1.6` are the earlier merges with 1.6.1 and 1.6.0.
+>   upstream's 1.7.3.
+> - `nemotron-1.7.3`: that merge as its own branch; `nemotron-1.7.2`,
+>   `nemotron-1.7`, `nemotron-1.6.1` and `nemotron-1.6` are the earlier
+>   merges with 1.7.2, 1.7.0, 1.6.1 and 1.6.0.
 > - `main`: tracks upstream unchanged.
 > - Other branches each stack on the one before, on upstream's `main` of
 >   October 31 (after 1.5.0), for changes that may be proposed upstream:
@@ -32,13 +33,13 @@
 >     upstream.
 >
 > The desktop app and Homebrew formula below are upstream's and don't include
-> these changes. Install the fork's prebuilt (still on 1.6.0)
-> [1.6.0-nemotron.1](https://github.com/ansoncat/splash-nemotron/releases/tag/1.6.0-nemotron.1)
+> these changes. Install the fork's prebuilt
+> [1.7.3-nemotron.1](https://github.com/ansoncat/splash-nemotron/releases/tag/1.7.3-nemotron.1)
 > (unsigned; Apple silicon, macOS 26.4 or later) as a `splash-nemotron`
 > command, beside any Homebrew `splash`:
 >
 > ```bash
-> curl -fsSL https://github.com/ansoncat/splash-nemotron/releases/download/1.6.0-nemotron.1/install.sh | sh
+> curl -fsSL https://github.com/ansoncat/splash-nemotron/releases/download/1.7.3-nemotron.1/install.sh | sh
 > splash-nemotron serve --model nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF
 > ```
 >
