@@ -28,7 +28,6 @@
 >   - `bench-tight-memory`: `backend-benchmark` warm-up under a tight `--max-memory`.
 >   - `super-vl`: Nemotron 3.5 Super VL, and NVFP464 for its official NVFP4 GGUF.
 >   - `nemotron-video`: video input with NVIDIA's EVS pruning.
->     `nemotron` is this branch plus this README.
 >   - The Flash-Next control vector is only on `nemotron`; it isn't meant for
 >     upstream.
 >
@@ -40,7 +39,7 @@
 >
 > ```bash
 > curl -fsSL https://github.com/ansoncat/splash-nemotron/releases/download/1.7.3-nemotron.1/install.sh | sh
-> splash-nemotron serve --model nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF
+> splash-nemotron serve --model nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF --activations bf16
 > ```
 >
 > Or build this branch from source. It needs macOS 26.4 or
@@ -51,7 +50,7 @@
 > git clone -b nemotron https://github.com/ansoncat/splash-nemotron.git
 > cd splash-nemotron
 > make -j4
-> ./splash serve --model nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF
+> ./splash serve --model nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF --activations bf16
 > ```
 >
 > The first serve sets up Python dependencies and downloads the model and its
@@ -172,7 +171,7 @@ picked automatically. NVIDIA ships it only as a GGUF, so the installer converts
 it once into a BF16 DFlash2 checkpoint.
 
 ```bash
-./splash serve --model nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF
+./splash serve --model nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF --activations bf16
 ```
 
 Super has no automatic draft. Download the target, ggml-org's LiLiCorr draft
@@ -186,16 +185,18 @@ hf download ggml-org/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF \
   lilicorr-NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-NVFP4.gguf --local-dir ~/models/super/lilicorr
 ./splash serve --model local/Super \
   --model-dir ~/models/super/UD-IQ2_XXS/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-UD-IQ2_XXS-00001-of-00003.gguf \
-  --draft-model ~/models/super/lilicorr --mmproj ~/models/super/mmproj-BF16.gguf
+  --draft-model ~/models/super/lilicorr --mmproj ~/models/super/mmproj-BF16.gguf \
+  --activations bf16
 ```
 
 The first serve prepares these files, converting the draft once; later starts
 reuse it.
 
-- Serve Bolt and Super with `--activations bf16`. Since upstream 1.7.2, Q8_0
-  prefill uses int8 activations by default. On an M5 Pro that made Bolt decode
-  about 4% slower (fewer draft tokens accepted), shrank Super's resident `auto`
-  context from 205K to 197K tokens, and didn't speed up prefill.
+- Serve Bolt and Super with `--activations bf16`. Since upstream 1.7.2, M5 and
+  newer Macs run Q8_0 prefill with int8 activations by default. On our 64 GB
+  M5 Pro, Bolt decoded about 4% slower (fewer draft tokens accepted) and its
+  prefill didn't get faster, and Super's automatic context with resident
+  experts dropped from 205K to 197K tokens.
 - When the experts don't fit, `--expert-memory auto` streams the routed experts
   from the SSD, as for the other MoE families.
 - Super's native window is 1,048,576 tokens; Splash serves it up to 1,010,000,
@@ -357,8 +358,9 @@ backend doesn't run them in NVFP4; Splash runs the official GGUF.
 - **Bolt with streamed experts**, `--max-memory 20G`: about 0.7× the resident
   decode speed, with logits bit-identical to resident. This was simulated on the
   64 GB Mac and hasn't been run on a 32 GB one.
-- **Super VL**, UD-IQ2_XXS: all experts resident on 64 GB, 147K-token automatic
-  context, decode 0.54–0.75× Bolt's.
+- **Super VL**, UD-IQ2_XXS: all experts resident on 64 GB, decode 0.54–0.75×
+  Bolt's (measured November 3 on upstream 1.5, with a 147K-token automatic
+  context; on 1.7.3 it is 205K with `--activations bf16`).
 
 | Model | GGUF | Experts on 64 GB | Decode |
 | --- | --- | --- | --- |
