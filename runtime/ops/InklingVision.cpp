@@ -130,6 +130,7 @@ void InklingVision::encode(CommandGraph &graph, ImageGrid grid, const MetalBuffe
   const VisionLayout &layout = model_.layout;
   if (!grid.valid() || grid.patches() > maximumPatches_)
     throw std::invalid_argument("image grid exceeds the vision encoder");
+  if (grid.frames != 1) throw std::invalid_argument("only RADIO encodes video");
   requireBytes(pixels, grid.pixelBytes(layout.patchSize), "image pixel");
   requireBytes(embeddings, uint64_t{grid.mergedTokens()} * layout.outputHiddenSize * kBf16Bytes, "image embedding");
 

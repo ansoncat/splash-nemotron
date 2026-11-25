@@ -4891,7 +4891,8 @@ ModelTelemetry Runtime::telemetry() const noexcept {
   result.stateHeldImageBytes = impl_->heldRowsBytes(false);
   for (const auto &[_, held] : impl_->imageRows) {
     if (const std::shared_ptr<const Impl::ImageRows> rows = held.lock())
-      result.imageRowsBytes += rows->pixels.allocatedBytes() + rows->embeddings.allocatedBytes();
+      result.imageRowsBytes += rows->pixels.allocatedBytes() + rows->embeddings.allocatedBytes() +
+                                rows->pruning.allocatedBytes();
   }
   return result;
 }
