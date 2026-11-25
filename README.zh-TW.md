@@ -9,6 +9,9 @@ NVIDIA Nemotron 3.5 兩顆模型：
 - Super 原生視窗是 1,048,576 token；Splash 最多開到 1,010,000（`--max-context` 的上限，
   `auto` 也以此為上限）。
 - 兩顆都能看影片，並照官方做法修剪影片 token（EVS）。
+- Bolt 和 Super 建議加 `--activations bf16` 啟動。上游 1.7.2 起 Q8_0 prefill 預設用 int8 activation，
+  在 M5 Pro 上 Bolt decode 約慢 4%（草稿接受數變少）、Super 常駐的 `auto` context 從 205K 降到 197K，
+  prefill 也沒變快。
 
 另外 Qwen3.8-Flash-Next 可以投影掉 control vector（[下面](#flash-next-control-vector)），只在 `nemotron`，不打算送上游。
 

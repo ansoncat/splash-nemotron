@@ -192,6 +192,10 @@ hf download ggml-org/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-GGUF \
 The first serve prepares these files, converting the draft once; later starts
 reuse it.
 
+- Serve Bolt and Super with `--activations bf16`. Since upstream 1.7.2, Q8_0
+  prefill uses int8 activations by default. On an M5 Pro that made Bolt decode
+  about 4% slower (fewer draft tokens accepted), shrank Super's resident `auto`
+  context from 205K to 197K tokens, and didn't speed up prefill.
 - When the experts don't fit, `--expert-memory auto` streams the routed experts
   from the SSD, as for the other MoE families.
 - Super's native window is 1,048,576 tokens; Splash serves it up to 1,010,000,
