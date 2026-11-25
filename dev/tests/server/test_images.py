@@ -148,10 +148,13 @@ class NemotronResizeTest(unittest.TestCase):
     def test_prepare_resizes_by_the_family_rule(self):
         prepared = images.prepare(png_bytes(48, 48), images.MAX_PIXELS, "nemotron")
         self.assertEqual((prepared.grid_height, prepared.grid_width), (32, 32))
-        cache = images.ImageCache()
         payload = png_bytes(64, 64)
-        qwen = cache.prepare(payload, images.MAX_PIXELS)
-        nemotron = cache.prepare(payload, images.MAX_PIXELS, "nemotron")
+        qwen = images.ImageCache(images.QWEN_IMAGES.prepare).prepare(
+            payload, images.MAX_PIXELS
+        )
+        nemotron = images.ImageCache(images.NEMOTRON_IMAGES.prepare).prepare(
+            payload, images.MAX_PIXELS
+        )
         self.assertEqual((qwen.grid_height, nemotron.grid_height), (16, 32))
 
 
@@ -253,10 +256,25 @@ class DataUrlTest(unittest.TestCase):
         payload = png_bytes(64, 64)
         url = "data:image/png;base64," + base64.b64encode(payload).decode()
         self.assertEqual(images.decode_data_url(url), payload)
+        # Wrapped at 76 columns as `base64` on Linux writes it, unpadded or
+        # URL-safe, the same bytes.
+        encoded = base64.b64encode(payload).decode()
+        wrapped = "\n".join(encoded[i : i + 76] for i in range(0, len(encoded), 76))
+        for variant in (
+            wrapped + "\n",
+            wrapped.replace("\n", "\r\n"),
+            encoded.rstrip("="),
+            base64.urlsafe_b64encode(payload).decode(),
+        ):
+            with self.subTest(variant=variant[-8:]):
+                self.assertEqual(
+                    images.decode_data_url("data:image/png;base64," + variant), payload
+                )
         for invalid in (
             "https://example.com/x.png",
             "data:image/png,rawbytes",
             "data:image/png;base64,not*base64",
+            "data:image/png;base64,abcde",
             None,
         ):
             with self.subTest(url=invalid):
@@ -498,6 +516,9 @@ class ImageRequestTest(HarnessTestCase):
                 digest_hi=0,
                 pixels=bytes([i]),
                 frames=1,
+                content_height=0,
+                content_width=0,
+                patch=16,
             )
             for i in (1, 2, 3)
         ]
@@ -524,27 +545,14 @@ class ImageRequestTest(HarnessTestCase):
             self.render(app, quoting, source, count=2)
 
     def test_images_resize_as_their_familys_processor_does(self):
-        image = SimpleNamespace(tokens=4, pixels=b"\x00")
-        for chat_format in (QWEN, NEMOTRON):
-            with self.subTest(resize=chat_format.image_resize):
-                app = object.__new__(request_frontend.Frontend)
-                app.chat_format = chat_format
-                app.max_image_pixels = 1 << 20
-                app.images = mock.Mock(request_batch=type("Batch", (list,), {}))
-                app.images.prepare.return_value = image
-                app._check_image_request_size = mock.Mock()
-                part = {"type": "image_url", "image_url": {"url": "unused"}}
-                with mock.patch.object(
-                    request_frontend.image_input, "decode_data_url", return_value=b""
-                ):
-                    prepared = app._prepare_images(
-                        [{"role": "user", "content": [part]}],
-                        deadline=time.monotonic() + 60,
-                    )
-                self.assertEqual(prepared, [image])
-                app.images.prepare.assert_called_once_with(
-                    b"", 1 << 20, chat_format.image_resize
-                )
+        from install import families
+
+        for family in families.FAMILIES:
+            with self.subTest(family=family.name):
+                if family.chat_format is NEMOTRON:
+                    self.assertIs(family.image_format, images.NEMOTRON_IMAGES)
+                elif family.chat_format is QWEN:
+                    self.assertIs(family.image_format, images.QWEN_IMAGES)
 
     def test_nemotron_videos_widen_to_labeled_tubelets(self):
         """As Nemotron Omni's processor widens <video>: each tubelet's label,
@@ -583,6 +591,9 @@ class ImageRequestTest(HarnessTestCase):
             digest_hi=0,
             pixels=bytes(2),
             frames=2,
+            content_height=0,
+            content_width=0,
+            patch=16,
         )
         picture = SimpleNamespace(
             tokens=4,
@@ -592,6 +603,9 @@ class ImageRequestTest(HarnessTestCase):
             digest_hi=0,
             pixels=bytes(1),
             frames=1,
+            content_height=0,
+            content_width=0,
+            patch=16,
         )
         expanded, spans, _ = app._expand_image_pads(
             tokens, [tubelet, tubelet, picture], positions
@@ -1059,6 +1073,48 @@ class ImageRequestTest(HarnessTestCase):
         del job
         self.assertEqual(app.images.stats()["request_bytes"], 0)
 
+    def test_an_image_that_cannot_be_decoded_is_refused_in_anthropic_s_words(self):
+        # Half of a PNG, as a file cut short on its way: each tower's
+        # preparation refuses it in the words Claude Code acts on, and a
+        # Messages request that holds it gets them in a 400.
+        payload = png_bytes(64, 64)
+        cut = payload[: len(payload) // 2]
+        for prepare in (images.prepare, images.prepare_inkling):
+            with self.subTest(prepare=prepare.__name__):
+                with self.assertRaises(images.ImageError) as refused:
+                    prepare(cut)
+                self.assertEqual(str(refused.exception), "Could not process image")
+        runtime = FakeRuntime()
+        harness = self.harness(runtime, tokenizer=ImagePadTokenizer())
+        source = {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": base64.b64encode(cut).decode(),
+        }
+        status, _, body = harness.request(
+            "POST",
+            "/v1/messages",
+            anthropic_body(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "what is this?"},
+                            {"type": "image", "source": source},
+                        ],
+                    }
+                ]
+            ),
+        )
+        self.assertEqual(status, 400, body)
+        error = json.loads(body)
+        self.assertEqual(error["type"], "error")
+        self.assertEqual(
+            (error["error"]["type"], error["error"]["message"]),
+            ("invalid_request_error", "Could not process image"),
+        )
+        self.assertEqual(runtime.requests, [])
+
     def test_anthropic_and_responses_images_reach_the_same_pipeline(self):
         runtime = FakeRuntime(Plan([[4]]), Plan([[4]]))
         harness = self.harness(runtime, tokenizer=ImagePadTokenizer())
@@ -1115,6 +1171,84 @@ class ImageRequestTest(HarnessTestCase):
         self.assertEqual(len(runtime.requests[1].frame.image_spans), 1)
         self.assertEqual(
             runtime.requests[1].frame.image_spans, runtime.requests[0].frame.image_spans
+        )
+
+    def test_a_messages_request_of_too_many_images_names_its_oldest(self):
+        # 65 images, the oldest in a tool result as Claude Code's Read sends
+        # one: the refusal names that block, which Claude Code then replaces
+        # with a note. 64 are taken, as before.
+        runtime = FakeRuntime(Plan([[4]]))
+        harness = self.harness(
+            runtime, tokenizer=ImagePadTokenizer(), max_context=65536
+        )
+        media_type, _, data = png_data_url((30, 200, 30)).partition(";base64,")
+        image = {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type.removeprefix("data:"),
+                "data": data,
+            },
+        }
+
+        def body(images):
+            return anthropic_body(
+                messages=[
+                    {"role": "user", "content": "screenshot it"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_1",
+                                "name": "screenshot",
+                                "input": {},
+                            }
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_1",
+                                "content": [{"type": "text", "text": "ok"}, image],
+                            },
+                            {"type": "text", "text": "and these"},
+                            *[image] * (images - 1),
+                        ],
+                    },
+                ]
+            )
+
+        for path in ("/v1/messages", "/v1/messages/count_tokens"):
+            with self.subTest(path=path):
+                status, _, refused = harness.request("POST", path, body(native_wire.MAX_IMAGE_SPANS + 1))
+                self.assertEqual(status, 400, refused)
+                self.assertEqual(
+                    json.loads(refused)["error"]["message"],
+                    "messages.2.content.0.tool_result.content.1.image: "
+                    f"requests support at most {native_wire.MAX_IMAGE_SPANS} images",
+                )
+        self.assertEqual(runtime.requests, [])
+        status, _, taken = harness.request("POST", "/v1/messages", body(native_wire.MAX_IMAGE_SPANS))
+        self.assertEqual(status, 200, taken)
+        self.assertEqual(len(runtime.requests[0].frame.image_spans), native_wire.MAX_IMAGE_SPANS)
+        # The oldest in a user's own content.
+        plain = anthropic_body(
+            messages=[
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "yes"},
+                {"role": "user", "content": [{"type": "text", "text": "these"}, image]},
+                {"role": "assistant", "content": "seen"},
+                {"role": "user", "content": [image] * native_wire.MAX_IMAGE_SPANS},
+            ]
+        )
+        status, _, refused = harness.request("POST", "/v1/messages", plain)
+        self.assertEqual(status, 400, refused)
+        self.assertEqual(
+            json.loads(refused)["error"]["message"],
+            f"messages.2.content.1.image: requests support at most {native_wire.MAX_IMAGE_SPANS} images",
         )
 
     def test_tool_results_carry_images_like_user_content(self):

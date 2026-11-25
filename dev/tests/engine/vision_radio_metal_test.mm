@@ -89,7 +89,7 @@ void requireNear(double actual, double expected, double relative, double absolut
 void checkPatchify(MetalBackend &backend, ImageGrid grid) {
   const uint32_t width = grid.width * 16;
   std::mt19937 random(grid.height * 31 + grid.width);
-  std::vector<uint8_t> pixels(grid.pixelBytes());
+  std::vector<uint8_t> pixels(grid.pixelBytes(kRadio.patchSize));
   for (uint8_t &pixel : pixels) pixel = static_cast<uint8_t>(random());
   const auto patches = static_cast<uint32_t>(grid.patches());
   std::vector<uint16_t> init(uint64_t{patches + 1} * kRadio.patchDimension, floatToBf16(kSentinel));

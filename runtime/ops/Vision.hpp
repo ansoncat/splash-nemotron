@@ -6,19 +6,33 @@
 #include "ops/Normalization.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace splash::ops {
 
-// A vision tower's geometry. The kernels compile two (kCompiledVision,
-// Vision.cpp): the defaults, Qwen3.5's 27 blocks, and kRadioVisionLayout,
-// Nemotron 3.5 Bolt's RADIO. outputHiddenSize, the width of the text model
-// its merger projects into, is each family's, stated beside its target
-// (Qwen3_8.hpp, Qwen3_6Moe.hpp).
+// The vision towers whose kernels Splash holds, each behind its encoder
+// (ImageEncoder): Qwen3.5's (ops::Vision), a ViT over 16-pixel patches of two
+// frames whose merger has a LayerNorm of its own; Inkling 2's
+// (ops::InklingVision), a ViT with a class token and LayerScale over
+// 20-pixel patches of one frame, merged into a projector without biases; and
+// Nemotron 3.5's RADIO (ops::Vision's own branch, on the Nemotron fork's
+// kernels).
+enum class VisionTower : uint8_t { Qwen, Inkling, Radio };
+
+// A vision tower's geometry. The defaults are Qwen3.5's 27 blocks;
+// outputHiddenSize, the width of the text model its merger projects into, is
+// each family's, its target's hidden size (visionLayout), and a family's
+// layout names its tower (QwenHybridLayout::visionTower; Nemotron's is
+// kRadioVisionLayout). paddedPatchDimension is the patch embedding's input
+// width as its image stores it, padded with zero columns to whole GEMM chunks
+// of 128.
 struct VisionLayout final {
+  VisionTower tower = VisionTower::Qwen;
   uint32_t depth = 27;
   uint32_t hiddenSize = 1152;
   uint32_t patchDimension = 1536;
+  uint32_t paddedPatchDimension = 1536;
   uint32_t intermediateSize = 4304;
   uint32_t paddedIntermediateSize = 4352;
   uint32_t mergedHiddenSize = 4608;
@@ -43,8 +57,22 @@ struct VisionLayout final {
 // RADIO (C-RADIO ViT-H/16): 32 blocks 1280 wide, 16 heads of 80, MLP 5120,
 // single-frame 768-value patches, a 128x128 position table, 10 prefix tokens,
 // and a merger of RMS norm, 5120 -> 20480, ReLU squared, -> output.
-inline constexpr VisionLayout kRadioVisionLayout{
-    32, 1280, 768, 5120, 5120, 5120, 0, 16, 80, 128, 16, 2, 10, 20480};
+inline constexpr VisionLayout kRadioVisionLayout{.tower = VisionTower::Radio,
+                                                 .depth = 32,
+                                                 .hiddenSize = 1280,
+                                                 .patchDimension = 768,
+                                                 .paddedPatchDimension = 768,
+                                                 .intermediateSize = 5120,
+                                                 .paddedIntermediateSize = 5120,
+                                                 .mergedHiddenSize = 5120,
+                                                 .outputHiddenSize = 0,
+                                                 .heads = 16,
+                                                 .headDimension = 80,
+                                                 .positionGridSide = 128,
+                                                 .patchSize = 16,
+                                                 .spatialMerge = 2,
+                                                 .prefixTokens = 10,
+                                                 .mergerIntermediateSize = 20480};
 // Whether a layout is RADIO's, whatever text model it projects into.
 [[nodiscard]] constexpr bool isRadioVision(VisionLayout layout) noexcept {
   layout.outputHiddenSize = 0;
@@ -58,6 +86,37 @@ inline constexpr VisionLayout kRadioVisionLayout{
 using VisionAffine = DenseWeights;
 using VisionNorm = LayerNormWeights;
 
+// Inkling 2's tower (clip.vision.projector_type inkling2v): 23 blocks of
+// width 1024, 16 heads of 64, an MLP of 4096, 20-pixel RGB patches (1200
+// values, stored padded to 1280), a learned 32x32 position grid, and a 2x2
+// merge into a projector whose hidden width is the merged one, 4096.
+inline constexpr VisionLayout kInklingVisionLayout{.tower = VisionTower::Inkling,
+                                                   .depth = 23,
+                                                   .hiddenSize = 1024,
+                                                   .patchDimension = 1200,
+                                                   .paddedPatchDimension = 1280,
+                                                   .intermediateSize = 4096,
+                                                   .paddedIntermediateSize = 4096,
+                                                   .mergedHiddenSize = 4096,
+                                                   .heads = 16,
+                                                   .headDimension = 64,
+                                                   .positionGridSide = 32,
+                                                   .patchSize = 20,
+                                                   .spatialMerge = 2};
+
+// The layout of `tower` whose merger projects into a text model of
+// `outputHiddenSize`.
+[[nodiscard]] constexpr VisionLayout visionLayout(VisionTower tower, uint32_t outputHiddenSize) noexcept {
+  VisionLayout layout = tower == VisionTower::Inkling ? kInklingVisionLayout
+                        : tower == VisionTower::Radio ? kRadioVisionLayout
+                                                      : VisionLayout{};
+  layout.outputHiddenSize = outputHiddenSize;
+  return layout;
+}
+
+// A block's weights, every one bf16. Inkling's tower scales its attention's
+// and MLP's outputs per channel before each residual add (LayerScale, its
+// output projections' DenseWeights::scale); Qwen's has no scales.
 struct VisionBlock final {
   LayerNormWeights norm1;
   DenseWeights qkv;
@@ -67,9 +126,13 @@ struct VisionBlock final {
   DenseWeights downProjection;
 };
 
-// bf16 weights. RADIO's patch embedding and merger have no biases (their bias
-// buffers stay empty), and its merger norm is an RMS weight per merged value
-// (mergerNorm.weight, no bias).
+// A tower's weights, every one bf16. Qwen's merger norms the blocks' output
+// (mergerNorm). Inkling's prepends a class token, its embedding and its
+// position as two rows (classToken), and norms the embeddings before the
+// blocks (inputNorm); its merger projections have zero biases, as its patch
+// embedding has, and its image stores them so. RADIO's patch embedding and
+// merger have no biases (their bias buffers stay empty), and its merger norm
+// is an RMS weight per merged value (mergerNorm.weight, no bias).
 struct VisionWeights final {
   VisionLayout layout;
   DenseWeights patchEmbedding;
@@ -82,17 +145,19 @@ struct VisionWeights final {
   VisionAffine mergerUpProjection;
   VisionAffine mergerDownProjection;
   metal::MetalBuffer prefixTokens = {};
+  metal::MetalBuffer classToken{};
+  LayerNormWeights inputNorm{};
 };
 
-// Input geometry shared by the frontend and runtime: RGB patch size and the
-// maximum number of patches per image.
+// Input geometry shared by the frontend and runtime: RGB pixels in square
+// patches of the tower's side (Qwen's 16, the protocol's default, or
+// Inkling's 20), and the maximum number of patches per image.
 inline constexpr uint32_t kImagePatchPixels = 16;
 inline constexpr uint32_t kImageChannels = 3;
 inline constexpr uint32_t kMaximumImagePatches = 16384;
-[[nodiscard]] constexpr uint64_t imagePixelBytes(uint32_t gridHeight,
-                                                 uint32_t gridWidth) noexcept {
-  return uint64_t{gridHeight} * kImagePatchPixels * gridWidth *
-         kImagePatchPixels * kImageChannels;
+[[nodiscard]] constexpr uint64_t imagePixelBytes(uint32_t gridHeight, uint32_t gridWidth,
+                                                 uint32_t patchPixels) noexcept {
+  return uint64_t{gridHeight} * patchPixels * gridWidth * patchPixels * kImageChannels;
 }
 // Patch-grid sides are multiples of the 2x2 spatial merge. Each merged token
 // covers four patches and follows row-major order over the merged grid. A
@@ -100,6 +165,12 @@ inline constexpr uint32_t kMaximumImagePatches = 16384;
 struct ImageGrid final {
   uint32_t height = 0; // patches
   uint32_t width = 0;
+  // The image's own pixels at its top left, before the padding to whole
+  // tokens (zero: the whole grid), which an Inkling tower's encoder takes as
+  // its reference pads them.
+  uint32_t contentHeight = 0;
+  uint32_t contentWidth = 0;
+  // A video's tubelet: two frames of one grid, encoded into one grid's tokens.
   uint32_t frames = 1;
 
   [[nodiscard]] bool valid() const noexcept {
@@ -112,20 +183,43 @@ struct ImageGrid final {
   [[nodiscard]] uint32_t mergedTokens() const noexcept {
     return (height / 2) * (width / 2);
   }
-  [[nodiscard]] uint64_t pixelBytes() const noexcept {
-    return imagePixelBytes(height, width) * frames;
+  // The bytes of its pixels, every frame's, in patches of `patchPixels` a side.
+  [[nodiscard]] uint64_t pixelBytes(uint32_t patchPixels) const noexcept {
+    return imagePixelBytes(height, width, patchPixels) * frames;
   }
 };
 
-// GPU vision encoder with one reusable scratch arena sized for maximumPatches.
-// encode() appends one image's dispatches, from resized uint8 RGB pixels to
-// bf16 language embeddings in the caller's buffer, a row of
-// layout.outputHiddenSize per merged token, so the arena can be released
-// after encoding while later chunks copy the image's rows into their hidden
-// rows (ops::RowCopy). The tower's projections, LayerNorms and attention are
-// the shared dense operators (ops/DenseLinear.hpp, ops/Normalization.hpp,
-// ops/DenseAttention.hpp).
-class Vision final {
+// A GPU vision encoder with one reusable scratch arena sized for
+// maximumPatches. encode() appends one image's dispatches, from its uint8 RGB
+// pixels in the tower's patches to bf16 language embeddings in the caller's
+// buffer, a row of layout.outputHiddenSize per merged token, so the arena can
+// be released after encoding while later chunks copy the image's rows into
+// their hidden rows (ops::RowCopy). The runtime holds whichever tower its
+// model has behind this interface.
+class ImageEncoder {
+public:
+  virtual ~ImageEncoder() = default;
+
+  // The scratch footprint of the layout's tower's encoder before
+  // construction, so the caller can reserve it.
+  [[nodiscard]] static uint64_t scratchBytes(const VisionLayout &layout, uint32_t maximumPatches);
+  // The encoder of the tower the weights' layout names; throws unless they
+  // hold every weight of it.
+  [[nodiscard]] static std::shared_ptr<ImageEncoder> make(metal::MetalBackend &backend, const VisionWeights &model,
+                                                          uint32_t maximumPatches);
+
+  // Its scratch arena as Metal allocates it (MetalBuffer::allocatedBytes).
+  [[nodiscard]] virtual uint64_t arenaBytes() const noexcept = 0;
+  // The most patches an image it encodes may have.
+  [[nodiscard]] virtual uint32_t maximumPatches() const noexcept = 0;
+  virtual void encode(metal::CommandGraph &graph, ImageGrid grid, const metal::MetalBuffer &pixels,
+                      const metal::MetalBuffer &embeddings) const = 0;
+};
+
+// Qwen3.5's tower, from resized pixels. Its projections, LayerNorms and
+// attention are the shared dense operators (ops/DenseLinear.hpp,
+// ops/Normalization.hpp, ops/DenseAttention.hpp).
+class Vision final : public ImageEncoder {
 public:
   // Scratch footprint before construction, so the caller can reserve it.
   [[nodiscard]] static uint64_t
@@ -141,17 +235,16 @@ public:
   Vision(const Vision &) = delete;
   Vision &operator=(const Vision &) = delete;
 
-  [[nodiscard]] uint64_t arenaBytes() const noexcept {
-    return arena_.sizeBytes();
+  [[nodiscard]] uint64_t arenaBytes() const noexcept override {
+    return arena_.allocatedBytes();
   }
-  // The most patches an image it encodes may have.
-  [[nodiscard]] uint32_t maximumPatches() const noexcept {
+  [[nodiscard]] uint32_t maximumPatches() const noexcept override {
     return maximumPatches_;
   }
 
   void encode(metal::CommandGraph &graph, ImageGrid grid,
               const metal::MetalBuffer &pixels,
-              const metal::MetalBuffer &embeddings) const;
+              const metal::MetalBuffer &embeddings) const override;
 
 private:
   enum class Scratch : uint32_t {

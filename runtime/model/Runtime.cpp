@@ -4,6 +4,7 @@
 #include "model/RuntimeInstrumentation.hpp"
 #endif
 #include "AwakeClock.hpp"
+#include "Checked.hpp"
 #include "StderrLine.hpp"
 #include "model/ExpertStore.hpp"
 #include "model/KvBlockCache.hpp"
@@ -321,6 +322,8 @@ struct Runtime::Impl {
     uint32_t tokens = 0;
     uint32_t tubelets = 1;
     uint32_t textTokens = 0;
+    uint32_t contentHeight = 0;
+    uint32_t contentWidth = 0;
 
     bool operator==(const ImageKey &) const = default;
   };
@@ -531,7 +534,7 @@ struct Runtime::Impl {
   // start that built it staged, and reclaimable once no image waits for one
   // and no refused start holds it. Injecting already encoded rows needs no
   // vision arena.
-  std::shared_ptr<ops::Vision> vision;
+  std::shared_ptr<ops::ImageEncoder> vision;
   // Every image's rows while anything holds them, so that a placement of
   // the same image anywhere shares them. The entries of rows nothing holds
   // any more go when the next start with images adds its own (activate).
@@ -674,7 +677,7 @@ struct Runtime::Impl {
     [[nodiscard]] PoolState state() const override {
       uint64_t held = 0, unit = 0;
       for (const std::shared_ptr<ImageRows> &entry : runtime_.embeddingCache) {
-        const uint64_t bytes = entry->embeddings.sizeBytes();
+        const uint64_t bytes = entry->embeddings.allocatedBytes();
         if (entry.use_count() > 1) held += bytes;
         else unit = bytes;
       }
@@ -928,6 +931,9 @@ struct Runtime::Impl {
            geometry.target.hiddenSize * sizeof(uint16_t);
   }
 
+  // The bytes of an image's pixels in the tower's patches.
+  uint64_t pixelBytes(const ImageSpan &span) const { return span.pixelBytes(model.descriptor.vision.patchSize); }
+
   ops::VideoPruningShape pruningShape(const ImageSpan &span) const noexcept {
     return {span.tubelets, span.grid(), geometry.target.hiddenSize, span.keptRows(), span.textTokens};
   }
@@ -950,13 +956,13 @@ struct Runtime::Impl {
 
   // The pixels the engine stages: a pruned video's also hold its text's
   // token ids, after its cuts.
-  static uint64_t stagedPixelBytes(const ImageSpan &span) noexcept {
-    return span.pixelBytes() + uint64_t{span.textTokens} * sizeof(uint32_t);
+  uint64_t stagedPixelBytes(const ImageSpan &span) const {
+    return pixelBytes(span) + uint64_t{span.textTokens} * sizeof(uint32_t);
   }
 
   static ImageKey imageKey(const ImageSpan &span) noexcept {
-    return {span.digestLo, span.digestHi, span.gridHeight, span.gridWidth, span.frames,
-            span.tokens, span.tubelets, span.textTokens};
+    return {span.digestLo,    span.digestHi, span.gridHeight,    span.gridWidth,     span.frames,
+            span.tokens,      span.tubelets, span.textTokens,   span.contentHeight, span.contentWidth};
   }
 
   // The rows of an identical image that something still holds, moved to the
@@ -971,13 +977,16 @@ struct Runtime::Impl {
 
   // Keeps encoded rows for reuse as the most recently used, dropping the
   // least recently used while the rows kept for reuse exceed the cache's
-  // bytes.
+  // bytes. Rows count as Metal allocates them (MetalBuffer::allocatedBytes),
+  // as the memory a reclaim frees: an image's rows are whole pages only at
+  // some token counts (every 32 tokens of Inkling-2-Mini's 2304 values), and
+  // take more than their values at the others.
   void retain(const std::shared_ptr<ImageRows> &rows) {
     if (rows->cached) {
       embeddingCache.splice(embeddingCache.begin(), embeddingCache, *rows->cached);
       return;
     }
-    const uint64_t bytes = rows->embeddings.sizeBytes();
+    const uint64_t bytes = rows->embeddings.allocatedBytes();
     embeddingCache.push_front(rows);
     rows->cached = embeddingCache.begin();
     embeddingCacheBytes += bytes;
@@ -1000,7 +1009,7 @@ struct Runtime::Impl {
             return other && other->rows == held->rows;
           });
       if (!counted)
-        bytes += held->rows->embeddings.sizeBytes();
+        bytes += held->rows->embeddings.allocatedBytes();
     }
     return bytes;
   }
@@ -1029,7 +1038,7 @@ struct Runtime::Impl {
             const std::shared_ptr<const HeldState> held = hold.lock();
             return held && held->rows == image.rows;
           });
-      const uint64_t added = kept ? 0 : image.rows->embeddings.sizeBytes();
+      const uint64_t added = kept ? 0 : image.rows->embeddings.allocatedBytes();
       if (embeddingCacheBytes + heldRowsBytes(true) + added > kEmbeddingCacheBytes)
         break;
       auto held = std::make_shared<const HeldState>(HeldState{std::move(state), image.rows});
@@ -1041,7 +1050,7 @@ struct Runtime::Impl {
 
   // Drops one entry of the embedding cache and returns the bytes it held.
   uint64_t uncache(std::list<std::shared_ptr<ImageRows>>::iterator entry) noexcept {
-    const uint64_t bytes = (*entry)->embeddings.sizeBytes();
+    const uint64_t bytes = (*entry)->embeddings.allocatedBytes();
     (*entry)->cached.reset();
     embeddingCache.erase(entry);
     embeddingCacheBytes -= bytes;
@@ -1123,7 +1132,7 @@ struct Runtime::Impl {
   // the start threw.
   struct VisionRollback final {
     Impl &runtime;
-    std::shared_ptr<ops::Vision> previous;
+    std::shared_ptr<ops::ImageEncoder> previous;
     bool committed = false;
     ~VisionRollback() {
       if (!committed)
@@ -1136,7 +1145,7 @@ struct Runtime::Impl {
   // covers it, that encoder.
   struct Matched final {
     std::vector<std::shared_ptr<ImageRows>> rows;
-    std::shared_ptr<ops::Vision> encoder;
+    std::shared_ptr<ops::ImageEncoder> encoder;
   };
 
   // A request's lane with everything else its start allocates, in one
@@ -1181,7 +1190,8 @@ struct Runtime::Impl {
         rows = std::make_shared<ImageRows>();
         rows->key = imageKey(span);
         imageRows.insert_or_assign(rows->key, rows);
-        bytes += stagedPixelBytes(span) + embeddingBytes(span) + pruningBytes(span);
+        // As Metal allocates them, whole pages, as the image cache counts them.
+        bytes += alignUp(stagedPixelBytes(span)) + alignUp(embeddingBytes(span)) + alignUp(pruningBytes(span));
       } else if (rows->embeddings && std::ranges::find(shared, rows) == shared.end()) {
         shared.push_back(rows);
       }
@@ -1191,13 +1201,13 @@ struct Runtime::Impl {
     }
     const uint64_t encoderBytes =
         encodePatches && !(vision && vision->maximumPatches() >= encodePatches)
-            ? ops::Vision::scratchBytes(model.vision.tensors.layout, encodePatches)
+            ? ops::ImageEncoder::scratchBytes(model.vision.tensors.layout, encodePatches)
             : 0;
-    std::shared_ptr<ops::Vision> encoder;
+    std::shared_ptr<ops::ImageEncoder> encoder;
     const uint8_t *pixels = request.imagePixels.data();
     const auto allocate = [&] {
       if (encoderBytes) {
-        encoder = std::make_shared<ops::Vision>(backend, model.vision.tensors, encodePatches);
+        encoder = ops::ImageEncoder::make(backend, model.vision.tensors, encodePatches);
       }
       for (ImageState &image : staged) {
         const ImageSpan &span = image.span;
@@ -1206,17 +1216,17 @@ struct Runtime::Impl {
           rows.pixels = backend.allocateBuffer(
               stagedPixelBytes(span), BufferStorage::Shared, "image pixels");
           uint8_t *staged = contents<uint8_t>(rows.pixels, "image pixels");
-          std::memcpy(staged, pixels, static_cast<size_t>(span.pixelBytes()));
+          std::memcpy(staged, pixels, static_cast<size_t>(pixelBytes(span)));
           // A pruned video's text is its span's first prompt tokens.
           if (span.pruned()) {
-            std::memcpy(staged + span.pixelBytes(), request.prompt.data() + span.offset,
+            std::memcpy(staged + pixelBytes(span), request.prompt.data() + span.offset,
                         size_t{span.textTokens} * sizeof(uint32_t));
             rows.pruning = backend.allocateBuffer(pruningBytes(span), BufferStorage::Private, "video pruning");
           }
           rows.embeddings = backend.allocateBuffer(
               embeddingBytes(span), BufferStorage::Private, "image embeddings");
         }
-        pixels += span.pixelBytes();
+        pixels += pixelBytes(span);
       }
     };
     StateAdmission admission = laneAdmission(
@@ -1244,9 +1254,13 @@ struct Runtime::Impl {
   // Encodes in `encodes` every image whose rows first appear in this chunk
   // and overwrites the chunk's placeholder embedding rows, the item's from
   // row `rowBegin` of `hidden` on, with the image rows. Text-only requests
-  // add no dispatches.
-  void addImageRows(CommandGraph &graph, CommandGraph &encodes, Request &entry, const ModelBatchItem &item,
-                    const MetalBuffer &hidden, uint32_t rowBegin) {
+  // add no dispatches. Returns the runs of the chunk's rows it wrote, which a
+  // target whose embedding rows are normed leaves as they are
+  // (QwenTargetPrefillSequence::imageRows).
+  std::vector<QwenTargetImageRows> addImageRows(CommandGraph &graph, CommandGraph &encodes, Request &entry,
+                                                const ModelBatchItem &item, const MetalBuffer &hidden,
+                                                uint32_t rowBegin) {
+    std::vector<QwenTargetImageRows> runs;
     const uint64_t chunkBegin = item.logicalPosition;
     const uint64_t chunkEnd = chunkBegin + item.tokenCount;
     for (ImageState &image : entry.images) {
@@ -1268,12 +1282,13 @@ struct Runtime::Impl {
         ++counters.imageEncodes;
       }
       const uint32_t width = model.vision.tensors.layout.outputHiddenSize;
-      ops::RowCopy::add(
-          graph, rows.embeddings,
-          {static_cast<uint32_t>(begin - image.span.offset), width, 0}, hidden,
-          {rowBegin + static_cast<uint32_t>(begin - chunkBegin), width, 0},
-          static_cast<uint32_t>(end - begin), width);
+      const QwenTargetImageRows run{rowBegin + static_cast<uint32_t>(begin - chunkBegin),
+                                    static_cast<uint32_t>(end - begin)};
+      ops::RowCopy::add(graph, rows.embeddings, {static_cast<uint32_t>(begin - image.span.offset), width, 0}, hidden,
+                        {run.begin, width, 0}, run.rows, width);
+      runs.push_back(run);
     }
+    return runs;
   }
 
   // A pruned video's tubelets one by one into its staging rows, its text's
@@ -1288,12 +1303,13 @@ struct Runtime::Impl {
       cursor += layout[part];
     }
     const uint64_t tubeletRows = layout[0] / span.tubelets;
+    const uint64_t tubeletBytes = grid.pixelBytes(model.descriptor.vision.patchSize);
     for (uint32_t tubelet = 0; tubelet < span.tubelets; ++tubelet)
-      vision->encode(encodes, grid, backend.view(rows.pixels, tubelet * grid.pixelBytes(), grid.pixelBytes()),
+      vision->encode(encodes, grid, backend.view(rows.pixels, tubelet * tubeletBytes, tubeletBytes),
                      backend.view(parts[0], tubelet * tubeletRows, tubeletRows));
-    const uint64_t cuts = uint64_t{span.tubelets} * grid.pixelBytes();
+    const uint64_t cuts = uint64_t{span.tubelets} * tubeletBytes;
     targetModel->addEmbedding(encodes,
-                              backend.view(rows.pixels, span.pixelBytes(), uint64_t{span.textTokens} * sizeof(uint32_t)),
+                              backend.view(rows.pixels, pixelBytes(span), uint64_t{span.textTokens} * sizeof(uint32_t)),
                               parts[1], span.textTokens);
     ops::VideoPruning::add(encodes, pruningShape(span), parts[0], parts[1],
                            backend.view(rows.pixels, cuts, uint64_t{span.tubelets} * sizeof(uint32_t)), parts[2],
@@ -2388,6 +2404,9 @@ struct Runtime::Impl {
     // Each part's states inside its rows, in their reservations' cells.
     std::vector<std::vector<QwenTargetStateCapture>> inside;
     inside.reserve(uint64_t{chunks.size()} * kLaneCount);
+    // Each part's rows of images, which a pass that begins the layers writes.
+    std::vector<std::vector<QwenTargetImageRows>> imageRuns;
+    imageRuns.reserve(uint64_t{chunks.size()} * kLaneCount);
     std::vector<QwenTargetPrefillChunk> modelChunks;
     modelChunks.reserve(chunks.size());
     for (uint32_t c = 0; c < chunks.size(); ++c) {
@@ -2405,7 +2424,9 @@ struct Runtime::Impl {
       for (uint32_t s = 0; s < chunk.sequences.size(); ++s) {
         const PrefillSequence &sequence = chunk.sequences[s];
         const ModelBatchItem &part = sequence.part;
-        if (begins) addImageRows(graph, encodes, *sequence.entry, part, model.buffers.hidden[0], sequence.rowBegin);
+        std::vector<QwenTargetImageRows> &imageRows = imageRuns.emplace_back();
+        if (begins)
+          imageRows = addImageRows(graph, encodes, *sequence.entry, part, model.buffers.hidden[0], sequence.rowBegin);
         const GdnParityBuffers &in = *from[sequence.lane], &out = *written[c][s];
         from[sequence.lane] = &out;
         QwenTargetPrefillSequence &destination = sequences[c].emplace_back();
@@ -2423,6 +2444,7 @@ struct Runtime::Impl {
         destination.recurrentOut = out.recurrentLayers;
         destination.auxiliaryIn = in.auxiliary;
         destination.auxiliaryOut = out.auxiliary;
+        destination.imageRows = imageRows;
         // A state at the part's end takes the codes of the state the part
         // writes, and the convolution rows and auxiliary state of the cell
         // it writes them to (above, or sealStates).
@@ -4869,7 +4891,7 @@ ModelTelemetry Runtime::telemetry() const noexcept {
   result.stateHeldImageBytes = impl_->heldRowsBytes(false);
   for (const auto &[_, held] : impl_->imageRows) {
     if (const std::shared_ptr<const Impl::ImageRows> rows = held.lock())
-      result.imageRowsBytes += rows->pixels.sizeBytes() + rows->embeddings.sizeBytes();
+      result.imageRowsBytes += rows->pixels.allocatedBytes() + rows->embeddings.allocatedBytes();
   }
   return result;
 }

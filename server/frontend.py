@@ -184,6 +184,7 @@ class Frontend:
         video_fps=image_input.VIDEO_FPS,
         video_max_frames=image_input.VIDEO_MAX_FRAMES,
         video_pruning=image_input.VIDEO_PRUNING,
+        image_format=image_input.QWEN_IMAGES,
         served_model_names=(),
         announce_served_name=False,
         reasoning_effort=None,
@@ -265,7 +266,8 @@ class Frontend:
         self.video_fps = video_fps
         self.video_max_frames = video_max_frames
         self.video_pruning = video_pruning
-        self.images = image_input.ImageCache()
+        # The served family's: how its tower takes an image.
+        self.images = image_input.ImageCache(image_format.prepare)
         self.ids = count(1)
         self.preparation_capacity = preparation_capacity
         self.preparation_slots = threading.BoundedSemaphore(preparation_capacity)
@@ -396,9 +398,7 @@ class Frontend:
                 else:
                     payload = image_input.decode_data_url(part["image_url"]["url"])
                     items = (
-                        self.images.prepare(
-                            payload, self.max_image_pixels, self.chat_format.image_resize
-                        ),
+                        self.images.prepare(payload, self.max_image_pixels),
                     )
                 for image in items:
                     tokens += image.tokens
@@ -537,6 +537,9 @@ class Frontend:
                     image.digest_lo,
                     image.digest_hi,
                     image.frames,
+                    content_height=image.content_height,
+                    content_width=image.content_width,
+                    patch=image.patch,
                 )
             )
             expanded.extend([pad_id] * image.tokens)
@@ -587,7 +590,7 @@ class Frontend:
             folded.append(
                 wire.ImageSpan(
                     len(tokens), len(text) + kept, first.grid_height, first.grid_width,
-                    lo, hi, first.frames, count, len(text),
+                    lo, hi, first.frames, count, len(text), patch=first.patch,
                 )
             )
             tokens.extend(text)

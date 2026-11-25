@@ -244,8 +244,6 @@ class ChatFormat:
     # Where the template's source writes image_pad for an image, as opposed to
     # testing a message's text for it (frontend._render_image_tokens).
     image_sites: tuple[str, ...] = ("<|image_pad|>",)
-    # How its processor resizes an image (images.RESIZE_RULES).
-    image_resize: str = "qwen"
     # The token the template writes for a video, which the server widens to
     # its tubelets as the processor labels them (images.prepare_video), and
     # where the template's source writes it; none where the family takes no
@@ -366,9 +364,10 @@ INKLING2 = ChatFormat(
     ),
     message_boundary="<|end_message|>",
     turn_openings=("<|message_user|>", "<|message_model|>", "<|message_tool|>"),
-    # Its vision tower is not served yet; its template writes an image as
-    # <|content_image|><|unused_200054|>.
-    image_pad=None,
+    # Its template writes an image as <|content_image|><|unused_200054|>, the
+    # placeholder one of the image's tokens, which preparation widens to all
+    # of them (server/images.py prepare_inkling).
+    image_pad="<|unused_200054|>",
 )
 
 # Nemotron-H's (Nemotron 3.5 Bolt, runtime/model/NemotronH.hpp): </s>
@@ -394,7 +393,6 @@ NEMOTRON = ChatFormat(
     image_open="<img>",
     image_close="</img>",
     image_sites=("+ '<image>'", "'><image>'"),
-    image_resize="nemotron",
     video_pad="<video>",
     video_sites=("+ '<video>'",),
 )

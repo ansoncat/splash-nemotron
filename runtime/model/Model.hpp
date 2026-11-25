@@ -186,10 +186,13 @@ struct ModelRequest final {
 
 // One image in the prompt: the run of placeholder tokens it occupies (one per
 // merged 2x2 patch group, row-major over the merged grid), the patch grid of
-// the image's resized pixels, and a 128-bit digest of that content.
-// Placeholder token ids are identical for every image, so cache identity keys
-// on the digest as well as the tokens. A video's tubelet is a span of two
-// frames: its pixels hold both, one after the other, and its tokens one grid's.
+// the image's prepared pixels, in patches of the model's tower's side
+// (ModelCapabilities::imagePatchPixels), the image's own pixels at its top
+// left, before the padding to that grid (zero: the whole grid), and a 128-bit
+// digest of that content. Placeholder token ids are identical for every
+// image, so cache identity keys on the digest as well as the tokens. A video's
+// tubelet is a span of two frames: its pixels hold both, one after the other,
+// and its tokens one grid's.
 //
 // A pruned video (textTokens > 0) is one span over all its tubelets, from its
 // first tubelet's rows to its last's, of the same grid. Its first textTokens
@@ -206,19 +209,22 @@ struct ImageSpan final {
   uint32_t gridWidth = 0;
   uint64_t digestLo = 0;
   uint64_t digestHi = 0;
+  uint32_t contentHeight = 0;
+  uint32_t contentWidth = 0;
   uint32_t frames = 1;
   uint32_t tubelets = 1;
   uint32_t textTokens = 0;
 
   [[nodiscard]] uint32_t end() const noexcept { return offset + tokens; }
   [[nodiscard]] ops::ImageGrid grid() const noexcept {
-    return {gridHeight, gridWidth, frames};
+    return {gridHeight, gridWidth, contentHeight, contentWidth, frames};
   }
   [[nodiscard]] bool pruned() const noexcept { return textTokens != 0; }
   // The tubelet rows a pruned video keeps.
   [[nodiscard]] uint32_t keptRows() const noexcept { return tokens - textTokens; }
-  [[nodiscard]] uint64_t pixelBytes() const noexcept {
-    return pruned() ? uint64_t{tubelets} * (grid().pixelBytes() + sizeof(uint32_t)) : grid().pixelBytes();
+  [[nodiscard]] uint64_t pixelBytes(uint32_t patchPixels) const noexcept {
+    return pruned() ? uint64_t{tubelets} * (grid().pixelBytes(patchPixels) + sizeof(uint32_t))
+                    : grid().pixelBytes(patchPixels);
   }
   // Folds into a block identity's two chains (engine::blockImageIdentity)
   // what a video adds: its tubelet's frames, and a pruned video's layout. An
@@ -241,10 +247,11 @@ struct ImageSpan final {
 // grid within the patch limit with one token per merged patch group (a
 // pruned video: its text, then between one tubelet's rows and all of them,
 // each tubelet's text at or after the one before), the runs are sorted,
-// disjoint and inside the prompt, and the pixels are the grids' own.
+// disjoint and inside the prompt, and the pixels are the grids' own, in
+// patches of `patchPixels` a side.
 [[nodiscard]] inline std::optional<std::string_view>
 imageSpansValidationError(std::span<const ImageSpan> spans, size_t promptTokens,
-                          std::span<const uint8_t> pixels) noexcept {
+                          std::span<const uint8_t> pixels, uint32_t patchPixels) noexcept {
   uint64_t previousEnd = 0;
   uint64_t gridPixelBytes = 0;
   for (const ImageSpan &span : spans) {
@@ -253,13 +260,16 @@ imageSpansValidationError(std::span<const ImageSpan> spans, size_t promptTokens,
       return "image grid must be even-sided and within the patch limit";
     if (!span.pruned() && (span.tubelets != 1 || span.tokens != grid.mergedTokens()))
       return "image span tokens must equal the merged grid size";
+    if (uint64_t{span.contentHeight} > uint64_t{span.gridHeight} * patchPixels ||
+        uint64_t{span.contentWidth} > uint64_t{span.gridWidth} * patchPixels)
+      return "image content must lie inside its grid";
     if (span.pruned()) {
       const uint64_t rows = grid.mergedTokens();
       if (span.frames != 2 || !span.tubelets ||
           span.tokens <= span.textTokens || span.keptRows() < rows ||
           span.keptRows() > rows * span.tubelets)
         return "a pruned video keeps between one tubelet's rows and all of them";
-      const uint64_t cuts = gridPixelBytes + uint64_t{span.tubelets} * grid.pixelBytes();
+      const uint64_t cuts = gridPixelBytes + uint64_t{span.tubelets} * grid.pixelBytes(patchPixels);
       if (cuts + uint64_t{span.tubelets} * sizeof(uint32_t) > pixels.size())
         return "image pixels do not match the image grids";
       uint32_t previous = 0;
@@ -277,7 +287,7 @@ imageSpansValidationError(std::span<const ImageSpan> spans, size_t promptTokens,
              "prompt";
     }
     previousEnd = end;
-    gridPixelBytes += span.pixelBytes();
+    gridPixelBytes += span.pixelBytes(patchPixels);
   }
   if (pixels.size() != gridPixelBytes)
     return "image pixels do not match the image grids";
@@ -604,6 +614,9 @@ struct ModelCapabilities final {
   uint32_t maximumContextTokens = 0;
   // Set for a block-sparse target.
   std::optional<SparseKvShape> sparseKv;
+  // The side of the square pixel patches of an image's grid (ImageSpan): its
+  // vision tower's (ops::VisionLayout::patchSize).
+  uint32_t imagePatchPixels = ops::kImagePatchPixels;
 };
 
 // A tier copy of one block's page, as reads of spilled K/V reach it on any

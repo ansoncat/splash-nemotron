@@ -1536,6 +1536,7 @@ def main():
             video_fps=args.video_fps,
             video_max_frames=args.video_max_frames,
             video_pruning=args.video_pruning,
+            image_format=family.image_format,
             thinking_codec=thinking_codec,
             response_store=dialects.responses.ResponseStore(),
             served_model_names=args.served_model_name,

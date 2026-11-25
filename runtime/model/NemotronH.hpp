@@ -74,6 +74,9 @@ struct NemotronHLayout final : QwenHybridLayout {
   static constexpr std::string_view modelType = "nemotron_h_moe_text";
   static constexpr std::string_view ggufArchitecture = "nemotron_h_moe";
   static constexpr bool loadsSafetensors = false;
+  // Its tower is RADIO (ops::kRadioVisionLayout), not the Qwen one the
+  // hybrid layout it extends names.
+  static constexpr ops::VisionTower visionTower = ops::VisionTower::Radio;
 
   // Its Mamba-2 state, whose cached states hold it as it runs: StateCodec's
   // codes are GDN layers'.

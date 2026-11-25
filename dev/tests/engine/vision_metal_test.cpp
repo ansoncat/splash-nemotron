@@ -68,7 +68,7 @@ void run(metal::MetalBackend &backend, const ops::VisionLayout &layout, bool rad
   model.mergerDownProjection = radio ? unbiased(layout.outputHiddenSize, intermediate)
                                      : affine(layout.outputHiddenSize, intermediate);
   if (radio) model.prefixTokens = tensor(uint64_t{layout.prefixTokens} * hidden);
-  const metal::MetalBuffer pixels = test::sharedBuffer(backend, kGrid.pixelBytes());
+  const metal::MetalBuffer pixels = test::sharedBuffer(backend, kGrid.pixelBytes(layout.patchSize));
   // RADIO's merger writes whole row tiles (Vision::embeddingRows); the Qwen tower writes its merged rows alone.
   const uint64_t embeddingRows = radio ? ops::Vision::embeddingRows(kGrid) : kGrid.mergedTokens();
   const metal::MetalBuffer embeddings =
@@ -145,7 +145,7 @@ void run(metal::MetalBackend &backend, const ops::VisionLayout &layout, bool rad
                   "a tower of " + std::to_string(depth) + " blocks was accepted");
   }
 
-  requireExtent(backend, pixels, kGrid.pixelBytes(), 1, "image pixel",
+  requireExtent(backend, pixels, kGrid.pixelBytes(layout.patchSize), 1, "image pixel",
                 [&](metal::CommandGraph &graph, const metal::MetalBuffer &view) {
                   encode(graph, model, view, embeddings);
                 });
@@ -179,7 +179,7 @@ void pruning(metal::MetalBackend &backend, uint32_t kept, bool nan = false) {
   std::vector<std::vector<float>> slopes{
       {0.0F, 0.5F, 1.0F, 2.0F}, {0.0F, 0.75F, 0.5F, 4.0F}, {0.0F, 0.75F, 2.0F, 0.25F}};
   if (nan) slopes[1][2] = std::numeric_limits<float>::quiet_NaN();
-  const ops::VideoPruningShape shape{3, {4, 4, 2}, 256, kept, 5};
+  const ops::VideoPruningShape shape{3, {.height = 4, .width = 4, .frames = 2}, 256, kept, 5};
   const std::vector<uint32_t> cuts{0, 2, 4};
   const uint32_t rows = shape.grid.mergedTokens(), stride = ops::Vision::embeddingRows(shape.grid);
   const uint32_t total = shape.tubelets * rows, width = shape.width;

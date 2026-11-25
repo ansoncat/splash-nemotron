@@ -1,6 +1,5 @@
 #include "model/QwenVision.hpp"
 #include "Checked.hpp"
-#include "model/VisionLoader.hpp"
 
 #include <string>
 #include <utility>
@@ -37,10 +36,12 @@ metal::MetalBuffer readTensor(WeightFile &file, uint32_t rows, uint32_t columns,
                       label);
 }
 
-// RADIO's tensors in the order VisionLoader.cpp plans them (planRadio): no
-// patch or merger biases, the prefix tokens after the positions, the
-// merger's RMS weight alone, and the video patch embedding last.
-void readRadio(WeightFile &file, const ops::VisionLayout &layout, ops::VisionWeights &tensors) {
+} // namespace
+
+ops::VisionWeights readRadioVision(WeightFile &file, const ops::VisionLayout &layout) {
+  ops::VisionWeights tensors;
+  tensors.layout = layout;
+  tensors.blocks.reserve(layout.depth);
   tensors.patchEmbedding = {readTensor(file, layout.hiddenSize, layout.patchDimension, "patch-embed"), {}};
   tensors.positionTable =
       readTensor(file, layout.positionGridSide * layout.positionGridSide, layout.hiddenSize, "position-table");
@@ -62,26 +63,16 @@ void readRadio(WeightFile &file, const ops::VisionLayout &layout, ops::VisionWei
   tensors.mergerDownProjection = {
       readTensor(file, layout.outputHiddenSize, layout.mergerIntermediateSize, "merger-fc2"), {}};
   tensors.videoPatchEmbedding = {readTensor(file, layout.hiddenSize, 2 * layout.patchDimension, "video-patch-embed"), {}};
+  return tensors;
 }
 
-QwenVisionWeights readVision(metal::MetalBackend &backend, WeightImages &images,
-                             ImagePlan image, const ops::VisionLayout &layout) {
-  const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
-  QwenVisionWeights result;
-  result.tensors.layout = layout;
-  result.tensors.blocks.reserve(layout.depth);
-
-  WeightFile file = images.load(std::move(image));
-  if (ops::isRadioVision(layout)) {
-    readRadio(file, layout, result.tensors);
-    file.finish();
-    result.files.push_back(file.record());
-    result.actualAllocatedBytes = metal::allocationDelta(allocationBaseline, backend.memoryStats().allocatedBytes);
-    return result;
-  }
-  result.tensors.patchEmbedding =
+ops::VisionWeights readQwenVision(WeightFile &file, const ops::VisionLayout &layout) {
+  ops::VisionWeights result;
+  result.layout = layout;
+  result.blocks.reserve(layout.depth);
+  result.patchEmbedding =
       readAffine(file, layout.hiddenSize, layout.patchDimension, "patch-embed");
-  result.tensors.positionTable = file.section(
+  result.positionTable = file.section(
       checkedMultiply<WeightStoreError>(
           checkedMultiply<WeightStoreError>(
               checkedMultiply<WeightStoreError>(layout.positionGridSide,
@@ -101,27 +92,14 @@ QwenVisionWeights readVision(metal::MetalBackend &backend, WeightImages &images,
                                     layout.hiddenSize, "fc1");
     block.downProjection = readAffine(file, layout.hiddenSize,
                                       layout.paddedIntermediateSize, "fc2");
-    result.tensors.blocks.push_back(std::move(block));
+    result.blocks.push_back(std::move(block));
   }
-  result.tensors.mergerNorm = readNorm(file, layout.hiddenSize, "merger-norm");
-  result.tensors.mergerUpProjection = readAffine(
+  result.mergerNorm = readNorm(file, layout.hiddenSize, "merger-norm");
+  result.mergerUpProjection = readAffine(
       file, layout.mergedHiddenSize, layout.mergedHiddenSize, "merger-fc1");
-  result.tensors.mergerDownProjection = readAffine(
+  result.mergerDownProjection = readAffine(
       file, layout.outputHiddenSize, layout.mergedHiddenSize, "merger-fc2");
-  file.finish();
-  result.files.push_back(file.record());
-
-  result.actualAllocatedBytes = metal::allocationDelta(
-      allocationBaseline, backend.memoryStats().allocatedBytes);
   return result;
-}
-
-} // namespace
-
-// The loader checked its layout when it was built.
-QwenVisionWeights loadQwenVisionWeights(metal::MetalBackend &backend, WeightImages &images,
-                                        const VisionLoader &source) {
-  return readVision(backend, images, source.image(), source.layout());
 }
 
 } // namespace splash::model

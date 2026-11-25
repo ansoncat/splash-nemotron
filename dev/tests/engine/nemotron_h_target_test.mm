@@ -205,7 +205,7 @@ std::vector<test_gguf::Key> fixtureMetadata(const model::NemotronHLayout &g) {
 
 model::ModelDescriptor descriptor(const model::NemotronHLayout &layout) {
   return model::makeModelDescriptor("nemotron-h-target-test", layout, model::DFlashDraftLayout{},
-                                    {.outputHiddenSize = layout.hiddenSize}, model::TargetSource::Gguf,
+                                    ops::visionLayout(layout.visionTower, layout.hiddenSize), model::TargetSource::Gguf,
                                     model::VisionSource::None);
 }
 

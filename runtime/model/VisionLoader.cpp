@@ -1,13 +1,21 @@
 #include "model/VisionLoader.hpp"
 #include "metal/abi/Vision.h"
 #include "model/GgufFile.hpp"
+#include "model/InklingVision.hpp"
+#include "model/QwenVision.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
 #include "model/VisionPreparation.hpp"
 #include "model/WeightLayout.hpp"
 
+#include <sys/mman.h>
+
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
+#include <functional>
+#include <memory>
 #include <set>
+#include <system_error>
 
 namespace splash::model {
 namespace {
@@ -58,8 +66,11 @@ void planRadio(const ops::VisionLayout &l, std::vector<Section> &sections) {
   add("v.patch_embd.weight.1", l.hiddenSize, 2 * l.patchDimension);
 }
 
-// The sections of layout, in file order, placed after the header block.
+// The sections of layout, in file order, placed after the header block:
+// Inkling's as its tower plans them (inklingVisionPlan), RADIO's (planRadio)
+// and Qwen's here.
 Plan plan(const ops::VisionLayout &l) {
+  if (l.tower == ops::VisionTower::Inkling) return inklingVisionPlan(l);
   Plan result{l.depth, l.patchSize, 0, {}};
   auto &sections = result.sections;
   if (ops::isRadioVision(l)) {
@@ -278,14 +289,18 @@ VisionLoader::VisionLoader(const std::filesystem::path &directory, VisionSource 
   auto planned = std::make_shared<Planned>();
   planned->layout = layout;
   planned->plan = plan(layout);
+  const bool inkling = layout.tower == ops::VisionTower::Inkling;
   if (source == VisionSource::Safetensors && ops::isRadioVision(layout)) {
     throw WeightStoreError("RADIO's vision tower loads from a GGUF mmproj only");
   } else if (source == VisionSource::Safetensors) {
     planned->checkpoint = std::make_unique<SafetensorsCheckpoint>(directory);
-    bindCheckpoint(*planned->checkpoint, layout, planned->plan);
+    if (inkling) bindInklingCheckpoint(*planned->checkpoint, layout, planned->plan);
+    else bindCheckpoint(*planned->checkpoint, layout, planned->plan);
   } else if (source == VisionSource::Gguf) {
     planned->mmproj = std::make_unique<WeightSource>(directory / "mmproj.gguf");
-    bindMmproj(GgufFile(*planned->mmproj), layout, planned->plan);
+    const GgufFile mmproj(*planned->mmproj);
+    if (inkling) bindInklingMmproj(mmproj, layout, planned->plan);
+    else bindMmproj(mmproj, layout, planned->plan);
   } else {
     throw WeightStoreError("only MLX and GGUF vision sources are written into images");
   }
@@ -304,19 +319,48 @@ ImagePlan VisionLoader::image() const {
           }};
 }
 
+void VisionLoader::check() const {
+  const ImagePlan plan = image();
+  const uint64_t bytes = plan.bytes;
+  void *memory = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+  if (memory == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "cannot map the vision image");
+  const std::unique_ptr<void, std::function<void(void *)>> mapped(memory, [bytes](void *m) { munmap(m, bytes); });
+  plan.write(std::span<uint8_t>(static_cast<uint8_t *>(memory), bytes), {});
+}
+
 uint64_t visionImageBytes(const ops::VisionLayout &layout) { return plan(layout).bytes; }
 
+VisionTowerWeights loadVisionTowerWeights(metal::MetalBackend &backend, WeightImages &images,
+                                          const VisionLoader &source) {
+  const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
+  const ops::VisionLayout &layout = source.layout();
+  VisionTowerWeights result;
+  WeightFile file = images.load(source.image());
+  result.tensors = layout.tower == ops::VisionTower::Inkling ? readInklingVision(file, layout)
+                   : ops::isRadioVision(layout)              ? readRadioVision(file, layout)
+                                                             : readQwenVision(file, layout);
+  file.finish();
+  result.files.push_back(file.record());
+  result.actualAllocatedBytes =
+      metal::allocationDelta(allocationBaseline, backend.memoryStats().allocatedBytes);
+  return result;
+}
+
 // The writer relies on the patch embedding's width, two frames of RGB
-// patches (RADIO's one), and on padding that only adds rows or columns.
+// patches for a Qwen tower and one of Inkling's or RADIO's (Inkling's stored
+// width only adds zero columns), and on padding that only adds rows or
+// columns.
 void requireVisionLayout(const ops::VisionLayout &layout) {
-  const uint32_t frames = ops::isRadioVision(layout) ? 1 : 2;
+  const uint32_t frames = layout.tower == ops::VisionTower::Qwen ? 2 : 1;
   if (!layout.depth || !layout.hiddenSize || !layout.patchDimension || !layout.intermediateSize ||
       !layout.paddedIntermediateSize || !layout.mergedHiddenSize || !layout.outputHiddenSize || !layout.heads ||
       !layout.headDimension || !layout.positionGridSide || !layout.patchSize || !layout.spatialMerge ||
       layout.heads * layout.headDimension != layout.hiddenSize ||
       layout.paddedIntermediateSize < layout.intermediateSize ||
       layout.mergedHiddenSize != layout.hiddenSize * layout.spatialMerge * layout.spatialMerge ||
-      layout.patchDimension != 3 * frames * layout.patchSize * layout.patchSize)
+      layout.patchDimension != 3 * frames * layout.patchSize * layout.patchSize ||
+      layout.paddedPatchDimension < layout.patchDimension ||
+      (layout.tower != ops::VisionTower::Inkling && layout.paddedPatchDimension != layout.patchDimension))
     throw WeightStoreError("vision layout is inconsistent");
 }
 

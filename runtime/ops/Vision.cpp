@@ -5,6 +5,7 @@
 #include "metal/abi/Vision.h"
 #include "ops/BufferExtent.hpp"
 #include "ops/DenseAttention.hpp"
+#include "ops/InklingVision.hpp"
 
 #include <algorithm>
 #include <array>
@@ -224,6 +225,20 @@ void requireWeights(const VisionWeights &model, bool radio) {
 
 } // namespace
 
+// Whole pages, each tower's the sum of its tensors' (alignUp), so the arena
+// Metal allocates is as large (arenaBytes).
+uint64_t ImageEncoder::scratchBytes(const VisionLayout &layout, uint32_t maximumPatches) {
+  return layout.tower == VisionTower::Inkling ? InklingVision::scratchBytes(layout, maximumPatches)
+                                              : Vision::scratchBytes(layout, maximumPatches);
+}
+
+std::shared_ptr<ImageEncoder> ImageEncoder::make(metal::MetalBackend &backend, const VisionWeights &model,
+                                                 uint32_t maximumPatches) {
+  if (model.layout.tower == VisionTower::Inkling)
+    return std::make_shared<InklingVision>(backend, model, maximumPatches);
+  return std::make_shared<Vision>(backend, model, maximumPatches);
+}
+
 uint64_t Vision::scratchBytes(const VisionLayout &layout,
                               uint32_t maximumPatches) {
   const bool radio = requireLayout(layout);
@@ -302,7 +317,7 @@ void Vision::encode(CommandGraph &graph, ImageGrid grid,
   }
   if (grid.frames != 1) throw std::invalid_argument("only RADIO encodes video");
   const auto tokens = static_cast<uint32_t>(grid.patches());
-  requireBytes(pixels, grid.pixelBytes(), "image pixel");
+  requireBytes(pixels, grid.pixelBytes(layout.patchSize), "image pixel");
   requireBytes(embeddings, uint64_t{grid.mergedTokens()} * layout.outputHiddenSize * kBf16Bytes,
                "image embedding");
 
@@ -373,7 +388,7 @@ void Vision::encodeRadio(CommandGraph &graph, ImageGrid grid, const MetalBuffer 
   const VisionLayout &layout = model_.layout;
   const auto patches = static_cast<uint32_t>(grid.patches());
   const uint32_t tokens = patches + layout.prefixTokens;
-  requireBytes(pixels, grid.pixelBytes(), "image pixel");
+  requireBytes(pixels, grid.pixelBytes(layout.patchSize), "image pixel");
   requireBytes(embeddings, uint64_t{embeddingRows(grid)} * layout.outputHiddenSize * kBf16Bytes,
                "image embedding");
 
