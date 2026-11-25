@@ -15,9 +15,11 @@
 //   nemotron-h-target METALLIB
 
 #include "Inkling2Fixtures.hpp"
+#include "TestFiles.hpp"
 #include "engine/MemoryGovernor.hpp"
 #include "engine/Types.hpp"
 #include "metal/MetalBackend.hpp"
+#include "model/ExpertStore.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/ModelSizing.hpp"
 #include "model/NemotronH.hpp"
@@ -242,6 +244,8 @@ std::vector<std::vector<float>> run(metal::MetalBackend &backend, model::LoadedM
     request.id = lane + 1;
     request.prompt = prompts[lane];
     request.maxNewTokens = 2;
+    // A first token that happens to be a stop token must not end the lane before its decode step.
+    request.flags = RequestIgnoreEndOfSequence;
     executor.beginColdRequest(request.modelView(), lane);
     tables[lane].resize(lanePages);
     std::iota(tables[lane].begin(), tables[lane].end(), lane * lanePages);
@@ -254,6 +258,9 @@ std::vector<std::vector<float>> run(metal::MetalBackend &backend, model::LoadedM
   const auto keep = [&](uint32_t lane) {
     const std::span<const float> last = model::RuntimeInstrumentation::lastLogits(executor, lane);
     require(last.size() >= vocabulary, "the run kept fewer logits than the vocabulary");
+    // Every logit, not only the selected one: a NaN elsewhere would slip past the comparison's maximum.
+    require(std::all_of(last.begin(), last.begin() + vocabulary, [](float v) { return std::isfinite(v); }),
+            "a run's logits are not finite");
     logits.emplace_back(last.begin(), last.begin() + vocabulary);
   };
   const std::vector<ModelStepResult> prefilled = executor.prefill(prefill, items);
@@ -292,14 +299,15 @@ double relativeDifference(const std::vector<std::vector<float>> &a, const std::v
 
 int main(int argc, char **argv) {
   @autoreleasepool {
-    const std::filesystem::path root = std::filesystem::temp_directory_path() / "nemotron-h-target-test";
+    if (argc != 2) {
+      std::cerr << "usage: nemotron-h-target METALLIB\n";
+      return 2;
+    }
     try {
-      if (argc != 2) {
-        std::cerr << "usage: nemotron-h-target METALLIB\n";
-        return 2;
-      }
+      // Declared before the backend and the models, so it is removed after they close its file.
+      const splash::test::TemporaryDirectory directory("nemotron-h-target");
+      const std::filesystem::path &root = directory.path();
       const model::NemotronHLayout layout = fixtureLayout();
-      std::filesystem::remove_all(root);
       std::filesystem::create_directories(root / "target");
       splash::test::writeFile(root / "target" / "nemotron-h-fixture.gguf",
                               test_gguf::file(fixtureMetadata(layout), fixtureTensors(layout)));
@@ -314,9 +322,6 @@ int main(int argc, char **argv) {
         model::LoadedModel model = model::loadModel(backend, root, described);
         resident = run(backend, model, prompts, layout.vocabularySize);
       }
-      for (const std::vector<float> &logits : resident)
-        require(std::all_of(logits.begin(), logits.end(), [](float v) { return std::isfinite(v); }),
-                "a resident run's logits are not finite");
       std::printf("nemotron-h-target: a prefill of prompts of %u and %u rows and a decode step of both, resident: "
                   "finite ok\n",
                   kPromptRows[0], kPromptRows[1]);
@@ -327,16 +332,19 @@ int main(int argc, char **argv) {
            .readers = std::make_shared<model::SsdReaders>(model::kSsdReaders)});
       require(streamed.expertStore() != nullptr, "the fixture's routed experts did not stream");
       const double difference = relativeDifference(resident, run(backend, streamed, prompts, layout.vocabularySize));
+      // The smallest store holds fewer slots than experts, so both the prefill's and the decode step's loads miss.
+      const model::ExpertStoreStats stats = streamed.expertStore()->stats();
+      require(stats.slots < stats.experts && stats.uses[0].loads > stats.uses[0].residentLoads &&
+                  stats.uses[1].loads > stats.uses[1].residentLoads,
+              "the streamed run's prefill or decode step read no routed experts");
       require(difference <= 1e-3, "the streamed run's logits are " + std::to_string(difference) +
                                       " of the largest apart from the resident run's");
       std::printf("nemotron-h-target: the same with the experts streamed through the smallest store: within %.2g of "
                   "the resident logits ok\n",
                   difference);
-      std::filesystem::remove_all(root);
       std::printf("nemotron-h-target: passed\n");
       return 0;
     } catch (const std::exception &error) {
-      std::filesystem::remove_all(root);
       std::cerr << "nemotron-h-target: " << error.what() << '\n';
       return 1;
     }
