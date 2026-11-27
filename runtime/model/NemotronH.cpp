@@ -131,6 +131,7 @@ NemotronHWeights loadNemotronHWeights(metal::MetalBackend &backend, const Nemotr
 
 QwenTargetGeometry qwenTargetGeometry(const NemotronHWeights &weights, std::span<const uint32_t> captureLayers) {
   QwenTargetGeometry geometry(weights.layout, captureLayers);
+  geometry.moeBlockOverride = weights.layout.moeBlockShape();
   geometry.kvLayout = weights.layout.kvLayout();
   geometry.stateLayout = weights.layout.gdnStateLayout();
   // The runtime sizes its MoE scratch for the geometry's shape, of the most
@@ -145,6 +146,8 @@ QwenTargetGeometry qwenTargetGeometry(const NemotronHWeights &weights, std::span
             for (const ops::Projection *p : {&block.latentDown, &block.latentUp, &block.sharedUp, &block.sharedDown})
               geometry.include(*p);
             moeBlocks.push_back(&block.experts);
+            geometry.moeMinExperts =
+                geometry.moeMinExperts ? std::min(geometry.moeMinExperts, block.shape.experts) : block.shape.experts;
           } else if constexpr (std::is_same_v<Block, NemotronMambaWeights>) {
             geometry.include(block.in);
             geometry.include(block.out);

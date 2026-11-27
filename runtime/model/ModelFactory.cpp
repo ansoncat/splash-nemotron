@@ -166,7 +166,11 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   if (result.descriptor.draft.present()) draft.emplace(backend, images, root / "draft", result.descriptor.draft);
   result.target = loadTarget(backend, images, root, result.descriptor, options);
   if (draft) result.draft = loadDFlashDraftWeights(backend, *draft, result.descriptor.draft);
-  result.vision = loadVisionWeights(backend, images, vision.get());
+  if (vision) {
+    result.visionImages = std::make_shared<WeightImages>(backend, result.descriptor.sourceIdentity);
+    result.visionImages->release();
+    result.vision = loadVisionWeights(backend, *result.visionImages, vision.get());
+  }
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),
                                         result.targetFiles().end());

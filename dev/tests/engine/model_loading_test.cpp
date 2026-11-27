@@ -726,9 +726,12 @@ void testSyntheticModel(MetalBackend &backend,
                     declaredBytes(model.vision.files) == expected.visionBytes,
                 "vision role records are incomplete");
         require(streamableWeights(root, descriptor, {}).loadedBytes ==
-                    expected.targetBytes + expected.draftBytes +
-                        expected.visionBytes,
-                "the weight budget does not count every image");
+                    expected.targetBytes + expected.draftBytes,
+                "the weight budget does not count every startup image");
+        require(model.vision.actualAllocatedBytes == 0 &&
+                    model.vision.imageBytes == expected.visionBytes &&
+                    model.visionImages && model.visionImages->released(),
+                "vision weights should start reserved on demand");
         require(loadedTarget.actualAllocatedBytes +
                     model.draft.actualAllocatedBytes +
                     model.vision.actualAllocatedBytes ==
@@ -772,8 +775,7 @@ void testSyntheticModel(MetalBackend &backend,
         actualTrackedBytes =
             backend.memoryStats().allocatedBytes - baseline;
         require(actualTrackedBytes >= expected.targetBytes +
-                                          expected.draftBytes +
-                                          expected.visionBytes,
+                                          expected.draftBytes,
                 "backend actual allocation accounting is below logical bytes");
 
         // The weights go back to memory as they were loaded.
@@ -783,7 +785,7 @@ void testSyntheticModel(MetalBackend &backend,
         model.images->release();
         require(backend.memoryStats().allocatedBytes - baseline ==
                     actualTrackedBytes - declaredBytes(loadedTarget.files) -
-                        declaredBytes(model.draft.files) - declaredBytes(model.vision.files),
+                        declaredBytes(model.draft.files),
                 "released weights remain in backend accounting");
         // They come back an image at a time, in load order.
         require(!model.images->restore(splash::test::admitAll) &&
@@ -798,6 +800,15 @@ void testSyntheticModel(MetalBackend &backend,
                                                      bytes.end());
                                }),
                 "restored weights differ from the loaded ones");
+        // On-demand vision weights restore synchronously and release cleanly.
+        model.visionImages->restoreAllSync();
+        require(!model.visionImages->released() && model.visionImages->hasAttachedMemory() &&
+                    backend.memoryStats().allocatedBytes - baseline >= actualTrackedBytes + expected.visionBytes,
+                "vision restoreAllSync did not allocate vision weights");
+        model.visionImages->release();
+        require(model.visionImages->released() && !model.visionImages->hasAttachedMemory() &&
+                    backend.memoryStats().allocatedBytes - baseline == actualTrackedBytes,
+                "vision release did not free vision weights");
     }
     require(backend.memoryStats().allocatedBytes == baseline,
             "the model's allocations survived its destruction");

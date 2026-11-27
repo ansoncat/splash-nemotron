@@ -108,7 +108,8 @@ StreamableWeights streamableWeights(const std::filesystem::path &root, const Mod
       },
       descriptor.target);
   if (descriptor.draft.present()) result.loadedBytes += draftImageBytes(root / "draft", descriptor.draft);
-  if (descriptor.hasVision()) result.loadedBytes += visionImageBytes(descriptor.vision);
+  // Vision weights load on demand (LoadedModel::visionImages) and are not
+  // permanent startup memory.
   return result;
 }
 

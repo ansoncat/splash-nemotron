@@ -128,9 +128,15 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   // Whether the blocks' experts take the int8 prefill passes: their routing
   // and formats (ops::moeInt8Experts), and resident (RuntimeGeometry::from).
   bool moeInt8Experts = false;
+  // Optional family-specific MoE block shape (e.g. Nemotron-H latent MoE,
+  // whose routed hidden width is moeLatentSize rather than hiddenSize), and
+  // the minimum expert count across MoE layers when layers vary (e.g. Bolt,
+  // where fewer experts can select a taller M64 tile than max experts).
+  std::optional<ops::MoeShape> moeBlockOverride;
+  uint32_t moeMinExperts = 0;
   // The blocks' shape as their plans take it.
   [[nodiscard]] ops::MoeShape moeShape() const noexcept {
-    ops::MoeShape shape = moeBlockShape();
+    ops::MoeShape shape = moeBlockOverride ? *moeBlockOverride : moeBlockShape();
     shape.int8Experts = moeInt8Experts;
     return shape;
   }
@@ -170,6 +176,10 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   [[nodiscard]] constexpr ops::AttentionVariant attentionVariant(uint32_t attention) const noexcept {
     return {.rotated = attention >= 64 || !(unrotatedLayers >> attention & 1),
             .windowTokens = kvLayout.windowed(attention) ? kvLayout.windowTokens : 0};
+  }
+  [[nodiscard]] constexpr bool hasRotatedAttention() const noexcept {
+    const uint32_t attention = attentionLayerCount();
+    return rotaryPairs && (attention >= 64 || (~unrotatedLayers & ((uint64_t{1} << attention) - 1)));
   }
   [[nodiscard]] constexpr std::span<const uint32_t>
   captureLayers() const noexcept {

@@ -46,6 +46,7 @@ struct VisionTowerWeights final {
   ops::VisionWeights tensors;
   std::vector<WeightFileRecord> files;
   uint64_t actualAllocatedBytes = 0;
+  uint64_t imageBytes = 0;
 };
 
 // The tower's image, written from its upstream source.

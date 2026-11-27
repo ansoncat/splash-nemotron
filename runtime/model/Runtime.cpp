@@ -643,7 +643,10 @@ struct Runtime::Impl {
   public:
     explicit VisionArenaPool(Impl &runtime) noexcept : runtime_(runtime) {}
     [[nodiscard]] PoolState state() const override {
-      const uint64_t bytes = runtime_.vision ? runtime_.vision->arenaBytes() : 0;
+      const uint64_t arena = runtime_.vision ? runtime_.vision->arenaBytes() : 0;
+      const uint64_t weights =
+          runtime_.model.visionImages && runtime_.model.visionImages->hasAttachedMemory() ? runtime_.model.vision.imageBytes : 0;
+      const uint64_t bytes = arena + weights;
       const bool idle = releasable();
       return {.name = "vision_arena",
               .floorBytes = idle ? 0 : bytes,
@@ -654,15 +657,25 @@ struct Runtime::Impl {
     }
     uint64_t release(uint64_t bytes) override {
       if (!bytes || !releasable()) return 0;
-      const uint64_t arena = runtime_.vision->arenaBytes();
-      runtime_.vision.reset();
-      return arena;
+      uint64_t freed = 0;
+      if (runtime_.vision) {
+        freed += runtime_.vision->arenaBytes();
+        runtime_.vision.reset();
+      }
+      if (runtime_.model.visionImages && runtime_.model.visionImages->hasAttachedMemory()) {
+        runtime_.model.visionImages->release();
+        freed += runtime_.model.vision.imageBytes;
+      }
+      return freed;
     }
     metal::AllocationResult grow(const metal::AllocationAdmission &) override { return {}; }
 
   private:
     [[nodiscard]] bool releasable() const {
-      return runtime_.vision && runtime_.vision.use_count() == 1 && runtime_.visionIdle();
+      if (runtime_.backend.commandInFlight()) return false;
+      const bool hasArena = runtime_.vision && runtime_.vision.use_count() == 1;
+      const bool hasWeights = runtime_.model.visionImages && runtime_.model.visionImages->hasAttachedMemory();
+      return (hasArena || hasWeights) && (!runtime_.vision || runtime_.vision.use_count() == 1) && runtime_.visionIdle();
     }
 
     Impl &runtime_;
@@ -1199,6 +1212,8 @@ struct Runtime::Impl {
         encodePatches = std::max(encodePatches, span.gridHeight * span.gridWidth);
       staged.push_back({span, std::move(rows)});
     }
+    const uint64_t visionWeightBytes =
+        encodePatches && model.visionImages && model.visionImages->released() ? model.vision.imageBytes : 0;
     const uint64_t encoderBytes =
         encodePatches && !(vision && vision->maximumPatches() >= encodePatches)
             ? ops::ImageEncoder::scratchBytes(model.vision.tensors.layout, encodePatches)
@@ -1206,31 +1221,41 @@ struct Runtime::Impl {
     std::shared_ptr<ops::ImageEncoder> encoder;
     const uint8_t *pixels = request.imagePixels.data();
     const auto allocate = [&] {
-      if (encoderBytes) {
-        encoder = ops::ImageEncoder::make(backend, model.vision.tensors, encodePatches);
-      }
-      for (ImageState &image : staged) {
-        const ImageSpan &span = image.span;
-        if (image.rows && !image.rows->embeddings) {
-          ImageRows &rows = *image.rows;
-          rows.pixels = backend.allocateBuffer(
-              stagedPixelBytes(span), BufferStorage::Shared, "image pixels");
-          uint8_t *staged = contents<uint8_t>(rows.pixels, "image pixels");
-          std::memcpy(staged, pixels, static_cast<size_t>(pixelBytes(span)));
-          // A pruned video's text is its span's first prompt tokens.
-          if (span.pruned()) {
-            std::memcpy(staged + pixelBytes(span), request.prompt.data() + span.offset,
-                        size_t{span.textTokens} * sizeof(uint32_t));
-            rows.pruning = backend.allocateBuffer(pruningBytes(span), BufferStorage::Private, "video pruning");
-          }
-          rows.embeddings = backend.allocateBuffer(
-              embeddingBytes(span), BufferStorage::Private, "image embeddings");
+      bool restoredWeights = false;
+      try {
+        if (visionWeightBytes) {
+          model.visionImages->restoreAllSync();
+          restoredWeights = true;
         }
-        pixels += pixelBytes(span);
+        if (encoderBytes) {
+          encoder = ops::ImageEncoder::make(backend, model.vision.tensors, encodePatches);
+        }
+        for (ImageState &image : staged) {
+          const ImageSpan &span = image.span;
+          if (image.rows && !image.rows->embeddings) {
+            ImageRows &rows = *image.rows;
+            rows.pixels = backend.allocateBuffer(
+                stagedPixelBytes(span), BufferStorage::Shared, "image pixels");
+            uint8_t *staged = contents<uint8_t>(rows.pixels, "image pixels");
+            std::memcpy(staged, pixels, static_cast<size_t>(pixelBytes(span)));
+            // A pruned video's text is its span's first prompt tokens.
+            if (span.pruned()) {
+              std::memcpy(staged + pixelBytes(span), request.prompt.data() + span.offset,
+                          size_t{span.textTokens} * sizeof(uint32_t));
+              rows.pruning = backend.allocateBuffer(pruningBytes(span), BufferStorage::Private, "video pruning");
+            }
+            rows.embeddings = backend.allocateBuffer(
+                embeddingBytes(span), BufferStorage::Private, "image embeddings");
+          }
+          pixels += pixelBytes(span);
+        }
+      } catch (...) {
+        if (restoredWeights && !backend.commandInFlight()) model.visionImages->release();
+        throw;
       }
     };
     StateAdmission admission = laneAdmission(
-        stateLane, states.tryActivateLane(stateLane, request.id, encoderBytes + bytes, allocate));
+        stateLane, states.tryActivateLane(stateLane, request.id, visionWeightBytes + encoderBytes + bytes, allocate));
     if (!admission.granted()) {
       admission.held = std::make_shared<const Matched>(
           Matched{std::move(shared), encodePatches && !encoderBytes ? vision : nullptr});
@@ -1462,8 +1487,9 @@ struct Runtime::Impl {
       draftCos = targetCos;
       draftSin = targetSin;
     }
-    // A target without RoPE builds no target tables, its draft's alone.
-    const uint32_t rotatedRows = geometry.target.rotaryPairs ? targetRows : 0;
+    // A target without rotated attention builds no target tables, its draft's alone.
+    const uint32_t targetPairs = geometry.target.hasRotatedAttention() ? geometry.target.rotaryPairs : 0;
+    const uint32_t rotatedRows = targetPairs ? targetRows : 0;
     if (!draftModel) draftRows = 0;
     if (!rotatedRows && !draftRows) return;
     ops::RoPE::addTables(
@@ -1475,7 +1501,7 @@ struct Runtime::Impl {
         {.target_rows = rotatedRows,
          .draft_rows = draftRows,
          .target_scale = geometry.target.ropeScaling.attentionFactor()},
-        kPrefillRows, geometry.target.rotaryPairs);
+        kPrefillRows, targetPairs);
   }
 
   // A constrained lane keeps its final prompt row, which prefill leaves at
@@ -3145,8 +3171,8 @@ struct Runtime::Impl {
     const MetalBuffer layout = decodeArena->batchSlice(DecodeTensor::LaneLayout, step.lanes);
     targetModel->addVerifyInput(graph, {decodeArena->batchSlice(DecodeTensor::InputTokens, step.lanes), tree,
                                         layout, step});
-    // A target without RoPE builds no target tables.
-    if (geometry.target.rotaryPairs)
+    // A target without rotated attention builds no target tables.
+    if (geometry.target.hasRotatedAttention())
       ops::RoPE::addTreeTables(graph, layout, tree, anchors.first(step.lanes),
                                prefillArena->get(PrefillTensor::TargetInverseFrequencies),
                                decodeArena->lanesRows(TargetTensor::RopeCos, step.lanes),

@@ -1,6 +1,7 @@
 #include "model/VisionLoader.hpp"
 #include "metal/abi/Vision.h"
 #include "model/GgufFile.hpp"
+#include "model/GgufImage.hpp"
 #include "model/InklingVision.hpp"
 #include "model/QwenVision.hpp"
 #include "model/SafetensorsCheckpoint.hpp"
@@ -312,11 +313,15 @@ VisionLoader::~VisionLoader() = default;
 const ops::VisionLayout &VisionLoader::layout() const noexcept { return planned_->layout; }
 
 ImagePlan VisionLoader::image() const {
+  const auto header = weightFileHeader(kVisionMagic, planned_->layout.depth, 0);
+  auto planned = std::make_shared<std::vector<gguf::Fill>>();
+  planned->push_back({0, std::vector<uint8_t>(header.begin(), header.end())});
   return {"vision/model.bin", std::string(kVisionMagic), planned_->layout.depth, 0, planned_->plan.bytes,
           [planned = planned_](std::span<uint8_t> bytes, const metal::MetalBuffer &) {
             vision::writeVision(bytes, planned->plan);
             planned->checkUnchanged();
-          }};
+          },
+          0, std::move(planned)};
 }
 
 void VisionLoader::check() const {
@@ -335,12 +340,14 @@ VisionTowerWeights loadVisionTowerWeights(metal::MetalBackend &backend, WeightIm
   const uint64_t allocationBaseline = backend.memoryStats().allocatedBytes;
   const ops::VisionLayout &layout = source.layout();
   VisionTowerWeights result;
-  WeightFile file = images.load(source.image());
+  const ImagePlan plan = source.image();
+  WeightFile file = images.load(plan);
   result.tensors = layout.tower == ops::VisionTower::Inkling ? readInklingVision(file, layout)
                    : ops::isRadioVision(layout)              ? readRadioVision(file, layout)
                                                              : readQwenVision(file, layout);
   file.finish();
   result.files.push_back(file.record());
+  result.imageBytes = plan.bytes;
   result.actualAllocatedBytes =
       metal::allocationDelta(allocationBaseline, backend.memoryStats().allocatedBytes);
   return result;

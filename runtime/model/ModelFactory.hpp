@@ -58,6 +58,9 @@ struct LoadedModel final {
   ModelDescriptor descriptor;
   // The memory of every image the weights below are views of.
   std::shared_ptr<WeightImages> images;
+  // On-demand memory for vision weights: reserved at load, restored only while
+  // images/videos are encoded, and released once encoding finishes.
+  std::shared_ptr<WeightImages> visionImages;
   TargetWeights target;
   DFlashDraftWeights draft;
   VisionTowerWeights vision;

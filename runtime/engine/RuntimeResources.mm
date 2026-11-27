@@ -482,7 +482,7 @@ std::array<uint8_t, 32> parseSha256(std::string_view value) {
 void requireLoadedModel(const model::LoadedModel &loaded) {
   if (!loaded.targetActualAllocatedBytes() ||
       (loaded.descriptor.draft.present() && !loaded.draft.actualAllocatedBytes) ||
-      (loaded.descriptor.hasVision() && !loaded.vision.actualAllocatedBytes) ||
+      (loaded.descriptor.hasVision() && !loaded.vision.actualAllocatedBytes && !loaded.vision.imageBytes) ||
       loaded.manifestFingerprintSha256.empty() ||
       loaded.targetManifestFingerprint().empty()) {
     throw std::invalid_argument(

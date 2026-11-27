@@ -73,7 +73,8 @@ private:
   void addBlock(PrefillStep &step, const NemotronMoeWeights &block, metal::MetalBuffer input,
                 metal::MetalBuffer output) const;
   void addPrefillMamba(PrefillStep &step, const NemotronMambaWeights &block, uint32_t layer,
-                       const QwenTargetPrefillSequence &sequence) const;
+                       const QwenTargetPrefillSequence &sequence, const metal::MetalBuffer &packed,
+                       const metal::MetalBuffer &y) const;
 
   const NemotronHWeights &weights_;
   metal::MetalBuffer decode_, prefill_;

@@ -18,8 +18,9 @@ std::array<uint64_t, targetTensorCount> targetTensorBytes(const QwenTargetGeomet
   put(TargetTensor::Hidden0, bytesFor<uint16_t>(rows * target.hiddenSize));
   put(TargetTensor::Hidden1, bytesFor<uint16_t>(rows * target.hiddenSize));
   put(TargetTensor::Normalized, bytesFor<uint16_t>(rows * target.hiddenSize));
-  // The GDN layers' scratch, which a target without them has none of.
-  const uint64_t gdnRows = target.stateLayout.layers ? rows : 0;
+  // The GDN layers' scratch, which targets without Qwen GDN layers (including
+  // single-block Mamba-2 targets like Nemotron-H) have none of.
+  const uint64_t gdnRows = (target.stateLayout.layers && !target.singleBlockLayers()) ? rows : 0;
   put(TargetTensor::GdnPacked, bytesFor<uint16_t>(gdnRows * target.packedGdnWidth));
   put(TargetTensor::GdnQueries, bytesFor<uint16_t>(gdnRows * target.gdnKeyWidth()));
   put(TargetTensor::GdnKeys, bytesFor<uint16_t>(gdnRows * target.gdnKeyWidth()));
@@ -35,13 +36,18 @@ std::array<uint64_t, targetTensorCount> targetTensorBytes(const QwenTargetGeomet
   put(TargetTensor::AttentionPartials, shape.attention.partialsBytes);
   put(TargetTensor::AttentionStatistics, shape.attention.statisticsBytes);
   put(TargetTensor::AttentionHidden, bytesFor<uint16_t>(rows * target.attentionWidth));
-  // The rows a mixer adds its output to, which the FFN adds to.
+  // The rows a mixer adds its output to, which the FFN adds to. Single-block
+  // targets (Nemotron-H) still reuse GdnOutput as the shared-expert residual
+  // buffer, but never use AttentionOutput.
   if (target.mixersAddToHidden()) {
-    put(TargetTensor::GdnOutput, bytesFor<uint16_t>(gdnRows * target.hiddenSize));
-    put(TargetTensor::AttentionOutput, bytesFor<uint16_t>(rows * target.hiddenSize));
+    put(TargetTensor::GdnOutput, bytesFor<uint16_t>((target.stateLayout.layers ? rows : 0) * target.hiddenSize));
+    if (!target.singleBlockLayers())
+      put(TargetTensor::AttentionOutput, bytesFor<uint16_t>(rows * target.hiddenSize));
   }
-  put(TargetTensor::RopeCos, bytesFor<float>(rows * target.rotaryPairs));
-  put(TargetTensor::RopeSin, bytesFor<float>(rows * target.rotaryPairs));
+  if (target.hasRotatedAttention()) {
+    put(TargetTensor::RopeCos, bytesFor<float>(rows * target.rotaryPairs));
+    put(TargetTensor::RopeSin, bytesFor<float>(rows * target.rotaryPairs));
+  }
   if (target.ffnKind == QwenFfnKind::SparseMoe)
     for (size_t field = 0; field < ops::kMoeScratchFields.size(); ++field)
       put(moeScratchTensor<TargetTensor>(field), shape.moe.*ops::kMoeScratchFields[field].bytes);
@@ -80,8 +86,16 @@ TargetRows prefillTargetRows(const RuntimeGeometry &geometry, const ops::Executi
                    // workspace in turn where they do not fit together.
                    .attention = attentionWorkspace(geometry, operators, ops::StepKind::Prefill),
                    .moe = {}};
-  if (target.ffnKind == QwenFfnKind::SparseMoe)
-    shape.moe = operators.moeWorkspace(target.moeShape(), target.moeRouterFormat, kPrefillRows, ops::StepKind::Prefill);
+  if (target.ffnKind == QwenFfnKind::SparseMoe) {
+    ops::MoeShape moe = target.moeShape();
+    shape.moe = operators.moeWorkspace(moe, target.moeRouterFormat, kPrefillRows, ops::StepKind::Prefill);
+    if (target.moeMinExperts && target.moeMinExperts < moe.experts) {
+      moe.experts = target.moeMinExperts;
+      const ops::MoeWorkspace narrow =
+          operators.moeWorkspace(moe, target.moeRouterFormat, kPrefillRows, ops::StepKind::Prefill);
+      for (const auto field : ops::kMoeWorkspaceFields) shape.moe.*field = std::max(shape.moe.*field, narrow.*field);
+    }
+  }
   return shape;
 }
 
@@ -97,9 +111,16 @@ TargetRows decodeTargetRows(const RuntimeGeometry &geometry, const ops::Executio
                    .lanes = geometry.target.lanes,
                    .attention = {lane.partialsBytes * geometry.target.lanes, lane.statisticsBytes * geometry.target.lanes},
                    .moe = {}};
-  if (target.ffnKind == QwenFfnKind::SparseMoe)
-    shape.moe = operators.moeWorkspace(target.moeShape(), target.moeRouterFormat, target.stepRows(),
-                                     ops::StepKind::Decode);
+  if (target.ffnKind == QwenFfnKind::SparseMoe) {
+    ops::MoeShape moe = target.moeShape();
+    shape.moe = operators.moeWorkspace(moe, target.moeRouterFormat, target.stepRows(), ops::StepKind::Decode);
+    if (target.moeMinExperts && target.moeMinExperts < moe.experts) {
+      moe.experts = target.moeMinExperts;
+      const ops::MoeWorkspace narrow =
+          operators.moeWorkspace(moe, target.moeRouterFormat, target.stepRows(), ops::StepKind::Decode);
+      for (const auto field : ops::kMoeWorkspaceFields) shape.moe.*field = std::max(shape.moe.*field, narrow.*field);
+    }
+  }
   return shape;
 }
 

@@ -35,16 +35,57 @@ std::array<uint64_t, 6> rowTensorBytes(uint64_t rows) {
           rows * layout.moeLatentSize * 2,         rows * layout.sharedIntermediateSize * 2};
 }
 
+// Where each Mamba-2 prefill scratch tensor (packed, y, gated) lives. Mamba-2
+// and MoE layers are separate single-block layers and never overlap in time, so
+// Mamba-2 prefill tensors alias the target arena's per-layer MoE scratch
+// (expertIntermediate, groupedInput) whenever those buffers are large enough.
+enum class MambaPrefillPool : uint8_t { Own, ExpertIntermediate, GroupedInput };
+
+struct MambaPrefillSlice final {
+  MambaPrefillPool pool = MambaPrefillPool::Own;
+  uint64_t offset = 0;
+  uint64_t bytes = 0;
+};
+
+std::array<MambaPrefillSlice, 3> mambaPrefillPlacement(const QwenTargetGeometry &g) {
+  const auto rows = rowTensorBytes(kPrefillScratchRows);
+  const NemotronHLayout layout;
+  const uint64_t routes = g.ffnKind == QwenFfnKind::SparseMoe
+                              ? uint64_t{ExecutionLimits::prefillTokenBudget} * g.expertsPerToken
+                              : 0;
+  const uint64_t interCap = routes * g.expertIntermediateSize * sizeof(uint16_t);
+  const uint64_t inputCap = routes * layout.moeLatentSize * sizeof(uint16_t);
+  uint64_t interUsed = 0, inputUsed = 0;
+  std::array<MambaPrefillSlice, 3> result{};
+  for (size_t i = 0; i < 3; ++i) {
+    const uint64_t aligned = alignUp(rows[i]);
+    if (interUsed + aligned <= interCap) {
+      result[i] = {MambaPrefillPool::ExpertIntermediate, interUsed, rows[i]};
+      interUsed += aligned;
+    } else if (inputUsed + aligned <= inputCap) {
+      result[i] = {MambaPrefillPool::GroupedInput, inputUsed, rows[i]};
+      inputUsed += aligned;
+    } else {
+      result[i] = {MambaPrefillPool::Own, 0, rows[i]};
+    }
+  }
+  return result;
+}
+
 std::vector<uint64_t> decodeTensorBytes(const QwenTargetGeometry &) {
   const auto rows = rowTensorBytes(kScratchRows);
   return {rows.begin(), rows.end()};
 }
 
-// The prefill scratch's: its rows', then two one-layer state cells
+// The prefill scratch's: its unaliased rows', then two one-layer state cells
 // (convolution, recurrent each) and a one-layer tape of two slots.
 std::vector<uint64_t> prefillTensorBytes(const QwenTargetGeometry &g) {
   const auto rows = rowTensorBytes(kPrefillScratchRows);
-  std::vector<uint64_t> bytes(rows.begin(), rows.end());
+  const auto mamba = mambaPrefillPlacement(g);
+  std::vector<uint64_t> bytes;
+  bytes.reserve(11);
+  for (size_t i = 0; i < 3; ++i) bytes.push_back(mamba[i].pool == MambaPrefillPool::Own ? rows[i] : 0);
+  bytes.insert(bytes.end(), rows.begin() + 3, rows.end());
   const ops::GdnStateStrides state = g.stateLayout.strides();
   for (int cell = 0; cell < 2; ++cell) bytes.insert(bytes.end(), {state.convolutionLayerBytes, state.recurrentLayerBytes});
   bytes.push_back(2 * mamba2TapeLayerBytes(g));
@@ -62,7 +103,7 @@ std::vector<metal::MetalBuffer> place(metal::MetalBackend &backend, const metal:
   std::vector<metal::MetalBuffer> views;
   uint64_t cursor = 0;
   for (const uint64_t bytes : sizes) {
-    views.push_back(backend.view(buffer, cursor, bytes));
+    views.push_back(bytes ? backend.view(buffer, cursor, bytes) : metal::MetalBuffer{});
     cursor += alignUp(bytes);
   }
   return views;
@@ -179,17 +220,31 @@ void NemotronHTarget::addBlock(PrefillStep &step, const NemotronMambaWeights &bl
                                metal::MetalBuffer output) const {
   const QwenTargetPrefillBuffers &b = step.buffers;
   const Rows &r = rows(step);
+  metal::MetalBuffer packed = r.packed, y = r.y, gated = r.gated;
+  if (!step.decode) {
+    const auto placement = mambaPrefillPlacement(geometry_);
+    const auto resolve = [&](const MambaPrefillSlice &s, const metal::MetalBuffer &own) {
+      if (s.pool == MambaPrefillPool::ExpertIntermediate)
+        return backend_.view(b.moe.expertIntermediate, s.offset, s.bytes);
+      if (s.pool == MambaPrefillPool::GroupedInput)
+        return backend_.view(b.moe.groupedInput, s.offset, s.bytes);
+      return own;
+    };
+    packed = resolve(placement[0], r.packed);
+    y = resolve(placement[1], r.y);
+    gated = resolve(placement[2], r.gated);
+  }
   const uint32_t layer = step.gdnLayer++;
-  addProjection(step, block.in, b.normalized, r.packed);
+  addProjection(step, block.in, b.normalized, packed);
   if (const QwenTargetDecodeBuffers *d = step.decode)
-    ops::Mamba2::addDecode(step.graph, r.packed, block.mixer, d->currentGdnStates, d->nextGdnStates, d->gdnTape,
-                           std::span(d->gdnTapeLanes).first(d->step.lanes), b.laneRows, step.rows, r.y,
+    ops::Mamba2::addDecode(step.graph, packed, block.mixer, d->currentGdnStates, d->nextGdnStates, d->gdnTape,
+                           std::span(d->gdnTapeLanes).first(d->step.lanes), b.laneRows, step.rows, y,
                            mamba2Shape(geometry_), layer, geometry_.stateLayout.strides());
   else
-    for (const QwenTargetPrefillSequence &sequence : step.sequences) addPrefillMamba(step, block, layer, sequence);
-  ops::Mamba2::addGroupNorm(step.graph, r.y, block.mixer.norm, r.gated, weights_.layout.rmsEpsilon,
+    for (const QwenTargetPrefillSequence &sequence : step.sequences) addPrefillMamba(step, block, layer, sequence, packed, y);
+  ops::Mamba2::addGroupNorm(step.graph, y, block.mixer.norm, gated, weights_.layout.rmsEpsilon,
                             mamba2Shape(geometry_), step.rows);
-  addProjection(step, block.out, r.gated, std::move(output), std::move(input));
+  addProjection(step, block.out, gated, std::move(output), std::move(input));
 }
 
 // A sequence's rows of layer `layer`, in slices of up to a verify block's
@@ -204,8 +259,8 @@ void NemotronHTarget::addBlock(PrefillStep &step, const NemotronMambaWeights &bl
 // ponytail: a verify block's rows a dispatch and a 2K-row scratch (~230 MB);
 // a chunked scan kernel when prefill speed or memory matters.
 void NemotronHTarget::addPrefillMamba(PrefillStep &step, const NemotronMambaWeights &block, uint32_t layer,
-                                      const QwenTargetPrefillSequence &sequence) const {
-  const Rows &r = prefillRows_;
+                                      const QwenTargetPrefillSequence &sequence, const metal::MetalBuffer &packed,
+                                      const metal::MetalBuffer &y) const {
   const PrefillStates &s = prefillStates_;
   const NemotronHLayout &layout = weights_.layout;
   std::vector<uint32_t> boundaries{0};
@@ -229,10 +284,10 @@ void NemotronHTarget::addPrefillMamba(PrefillStep &step, const NemotronMambaWeig
   // The one-layer cell the state is in, 2 for none of them.
   uint32_t cell = 2;
   const auto run = [&](size_t k, uint32_t row, metal::MetalBuffer convolutionOut, metal::MetalBuffer recurrentOut) {
-    ops::Mamba2::addPrefillStep(step.graph, rowsOf<uint16_t>(r.packed, row, kVerifyRows, layout.mambaInProjectionRows),
+    ops::Mamba2::addPrefillStep(step.graph, rowsOf<uint16_t>(packed, row, kVerifyRows, layout.mambaInProjectionRows),
                                 block.mixer, {convolution, recurrent, convolutionOut, recurrentOut}, s.tape,
                                 (k + 1) % 2 * tapeBytes, k % 2 * tapeBytes, k ? slices[k - 1].rows : 0,
-                                rowsOf<float>(r.y, row, kVerifyRows, layout.mambaInnerSize), mamba2Shape(geometry_));
+                                rowsOf<float>(y, row, kVerifyRows, layout.mambaInnerSize), mamba2Shape(geometry_));
   };
   for (size_t k = 0; k <= slices.size(); ++k) {
     const bool fold = k == slices.size();

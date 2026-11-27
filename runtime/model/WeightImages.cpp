@@ -96,6 +96,31 @@ bool WeightImages::restore(const metal::AllocationAdmission &admit) {
   return !released_;
 }
 
+void WeightImages::restoreAllSync() {
+  if (!released_) return;
+  static_cast<void>(endWrite());
+  size_t attached = restored_;
+  try {
+    for (size_t i = 0; i < images_.size(); ++i) {
+      Image &image = images_[i];
+      if (i >= attached) {
+        backend_->restoreMemory(image.buffer);
+        attached = i + 1;
+      }
+      image.write(contentsOf(image.buffer), image.buffer);
+    }
+  } catch (...) {
+    if (!backend_->commandInFlight()) {
+      while (attached > restored_) backend_->releaseMemory(images_[--attached].buffer);
+    } else {
+      restored_ = attached;
+    }
+    throw;
+  }
+  restored_ = images_.size();
+  released_ = false;
+}
+
 std::vector<WeightImages::Contents> WeightImages::contents() const {
   std::vector<Contents> result;
   for (const Image &image : images_) {

@@ -84,11 +84,17 @@ public:
   // What every image's file records the sources hold.
   [[nodiscard]] const std::string &contentIdentity() const noexcept { return contentIdentity_; }
   [[nodiscard]] bool released() const noexcept override { return released_; }
+  // True whenever at least one image currently holds allocated Metal memory
+  // (including a partial restore whose write failed while a command ran).
+  [[nodiscard]] bool hasAttachedMemory() const noexcept { return !released_ || restored_ > 0; }
   // An image being written ends first: its memory goes back with the others.
   void release() override;
   // Ends the write of the last image it took back, then takes back the next
   // and starts writing it on a thread of its own.
   [[nodiscard]] bool restore(const metal::AllocationAdmission &admit) override;
+  // Synchronously restores every released image in place (for on-demand
+  // components whose memory has already been admitted by the caller).
+  void restoreAllSync();
   [[nodiscard]] bool writing() const noexcept override;
   // The writes restore() starts from then on call `notifier` on their thread
   // as they end.
