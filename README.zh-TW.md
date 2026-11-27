@@ -39,12 +39,12 @@ NVIDIA Nemotron 3.5 兩顆模型：
 
 ## 安裝預先編譯版
 
-[1.7.3-nemotron.1](https://github.com/ansoncat/splash-nemotron/releases/tag/1.7.3-nemotron.1)：
+[1.7.3-nemotron.2](https://github.com/ansoncat/splash-nemotron/releases/tag/1.7.3-nemotron.2)：
 Apple silicon、macOS 26.4 以上，沒有簽章。裝成 `splash-nemotron` 指令（在 `~/.local`），不會蓋掉
 Homebrew 的 `splash`。
 
 ```bash
-curl -fsSL https://github.com/ansoncat/splash-nemotron/releases/download/1.7.3-nemotron.1/install.sh | sh
+curl -fsSL https://github.com/ansoncat/splash-nemotron/releases/download/1.7.3-nemotron.2/install.sh | sh
 splash-nemotron serve --model nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF --activations bf16
 ```
 
@@ -110,5 +110,21 @@ Bolt decode 對 llama.cpp（greedy、thinking 關、同場次交錯、關 prefix
 
 兩組差別都不顯著（McNemar p 0.89、0.45）。Video-MME 有三分之一題在 16,384 token 內
 還沒想完，算錯；也只用了 256 MiB 以下的片。
+
+### 記憶體優化與各量化版實測（`1.7.3-nemotron.2`，256K context）
+
+`1.7.3-nemotron.2` 修正 Nemotron-H latent MoE scratch 計算、共用 Mamba-2／MoE prefill
+scratch（Super −1.28 GiB、Bolt −438 MiB）、看圖權重改為首次看圖／影片才載入（−1.57 GiB），並將
+SSD 專家串流 staging 上限壓在 320 MiB（Super 1,296 → 319 MiB）：
+
+- **Super VL `UD-IQ2_XXS`（47.6 GiB）**：64 GB 上 256K context 可 100% 常駐（actual ~46.9 GiB），
+  32k decode 45–46 tok/s。
+- **Super VL `UD-IQ3_XXS`（55.7 GiB）**：64 GB 上 256K context 專家常駐 80–82%（decode 命中 95.5%），
+  decode 達 `UD-IQ2_XXS` 的 **0.85×**（34–57 tok/s，32k 40.5 tok/s；較 1.5 舊版 0.56–0.70× 大幅提升），
+  actual ~47.3 GiB。
+- **Bolt `UD-Q4_K_XL`（46.7 GiB）**：64 GB 上 256K 可全常駐（actual 48.9 GiB；`--expert-memory 38G`
+  94.8% 常駐、命中 98.9%、速度 1.01×），decode 為官方 24GB 版的 0.82×；但品質測試繁中洩漏較高
+  （5.43% vs 2.31%）且 BFCL parallel 顯著輸 Super `UD-IQ3_XXS`（69% vs 81%，p=0.0022）。維護者日常
+  使用 Bolt 官方 NVFP4 與 Super `UD-IQ3_XXS`。
 
 其他數字（Super、expert 串流、各量化版）見 [README 的 Performance 段](README.md#nemotron-35-on-this-fork)。

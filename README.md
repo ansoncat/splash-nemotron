@@ -33,12 +33,12 @@
 >
 > The desktop app and Homebrew formula below are upstream's and don't include
 > these changes. Install the fork's prebuilt
-> [1.7.3-nemotron.1](https://github.com/ansoncat/splash-nemotron/releases/tag/1.7.3-nemotron.1)
+> [1.7.3-nemotron.2](https://github.com/ansoncat/splash-nemotron/releases/tag/1.7.3-nemotron.2)
 > (unsigned; Apple silicon, macOS 26.4 or later) as a `splash-nemotron`
 > command, beside any Homebrew `splash`:
 >
 > ```bash
-> curl -fsSL https://github.com/ansoncat/splash-nemotron/releases/download/1.7.3-nemotron.1/install.sh | sh
+> curl -fsSL https://github.com/ansoncat/splash-nemotron/releases/download/1.7.3-nemotron.2/install.sh | sh
 > splash-nemotron serve --model nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF --activations bf16
 > ```
 >
@@ -358,21 +358,32 @@ backend doesn't run them in NVFP4; Splash runs the official GGUF.
 - **Bolt with streamed experts**, `--max-memory 20G`: about 0.7× the resident
   decode speed, with logits bit-identical to resident. This was simulated on the
   64 GB Mac and hasn't been run on a 32 GB one.
-- **Super VL**, UD-IQ2_XXS: all experts resident on 64 GB, decode 0.54–0.75×
-  Bolt's (measured November 3 on upstream 1.5, with a 147K-token automatic
-  context; on 1.7.3 it is 205K with `--activations bf16`).
+- **Memory optimizations (1.7.3-nemotron.2)**: fixed Nemotron-H latent MoE
+  prefill scratch sizing, aliased Mamba-2/MoE prefill scratch (−1.28 GiB on
+  Super, −438 MiB on Bolt), deferred RADIO vision weight loading until the first
+  image or video (−1.57 GiB), and capped streamed expert staging at 320 MiB
+  (Super staging 1,296 → 319 MiB; Bolt widest layer 387 → 320 MiB). On 64 GB,
+  Super `UD-IQ2_XXS` now stays 100% resident at 256K context (~46.9 GiB actual),
+  and Super `UD-IQ3_XXS` streams at 80–82% residency (95.5% decode hit rate) at
+  full 256K context with 0.85× `UD-IQ2_XXS` decode speed (up from 0.56–0.70× on
+  1.5).
 
-| Model | GGUF | Experts on 64 GB | Decode |
+| Model | GGUF | Experts on 64 GB (256K) | Decode |
 | --- | --- | --- | --- |
-| Bolt | NVIDIA NVFP4 (24 GB) | resident | baseline |
+| Bolt | NVIDIA NVFP4 (24 GB) | resident (~25.0 GiB actual) | baseline |
 | Bolt | unsloth UD-IQ2_XXS | resident | 0.94–1.19× |
-| Super VL | unsloth UD-IQ2_XXS (47.6 GiB) | resident | baseline |
-| Super VL | unsloth UD-IQ3_XXS (55.7 GiB) | 78% resident, streamed | 0.56–0.70× |
-| Super VL | ggml-org NVFP4 (71.6 GiB) | 47% resident, streamed | 0.16–0.29× |
+| Bolt | unsloth UD-Q4_K_XL (46.7 GiB) | resident (or 95% with `--expert-memory 38G`) | 0.82× (1.01× at `38G`) |
+| Super VL | unsloth UD-IQ2_XXS (47.6 GiB) | resident (~46.9 GiB actual) | baseline (0.54–0.75× Bolt) |
+| Super VL | unsloth UD-IQ3_XXS (55.7 GiB) | 80–82% resident, streamed (~47.3 GiB actual) | 0.85× (34–57 tok/s; 32k 40.5) |
+| Super VL | ggml-org NVFP4 (71.6 GiB) | 47% resident, streamed (measured on 1.5) | 0.16–0.29× |
 
-On HumanEval+, BFCL and a Traditional Chinese check, the measured quantizations
-of each model showed no clear quality difference (Super's NVFP4 wasn't
-measured). The maintainer runs Bolt's NVFP4 and Super's UD-IQ2_XXS.
+On HumanEval+, BFCL and a Traditional Chinese check, Super's `UD-IQ2_XXS` and
+`UD-IQ3_XXS` showed no statistically significant difference (Super's NVFP4
+wasn't measured). Bolt's `UD-Q4_K_XL` improved BFCL multiple over NVIDIA's NVFP4
+(96% vs 91%, p = 0.021), but leaked more Simplified Chinese (5.43% vs 2.31%) and
+trailed Super `UD-IQ3_XXS` on BFCL parallel (69% vs 81%, p = 0.0022) at the same
+~53.5 GiB wired footprint. The maintainer runs Bolt's NVFP4 and Super's
+`UD-IQ3_XXS`.
 
 Video, Bolt at 1 FPS and up to 128 frames, greedy, EVS pruning off (`0`)
 against the default `0.7`:
