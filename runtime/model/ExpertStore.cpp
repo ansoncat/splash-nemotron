@@ -198,13 +198,24 @@ Geometry geometryOf(const StreamedBlocks &streamed, ops::MoeShape shape) {
   return g;
 }
 
-// The staging: the experts of a block kCycleRows rows may route, and at
-// least two places, of which a round of a load of more rows than those
-// stages one half.
+// Cap the staging buffer so large-expert MoE models (e.g. Nemotron 3.5 Super
+// with 512 x ~2.5 MiB experts) do not pin >1 GiB of wired staging RAM;
+// multi-round loading handles any step whose misses exceed staging capacity.
+constexpr uint64_t kMaxStagingBytes = 320ULL << 20;
+
+// The staging: the experts of a block kCycleRows rows may route, capped to
+// kMaxStagingBytes (rounded down to an even count, at least 2*kAheadReaders
+// when capped so prefill's half-staging and cycle loads past the cap keep
+// headroom above in-flight read-aheads), and at least two places, of which a
+// round of a load of more rows than those stages one half.
 Places stagingOf(const Geometry &g, ops::MoeShape shape) {
-  return {g.placeBytes,
-          static_cast<uint32_t>(std::max<uint64_t>(
-              2, std::min<uint64_t>(shape.experts, uint64_t{kCycleRows} * shape.expertsPerToken)))};
+  uint64_t places = std::min<uint64_t>(shape.experts, uint64_t{kCycleRows} * shape.expertsPerToken);
+  const uint64_t onePlace = Places(g.placeBytes, 1).bytes();
+  if (onePlace > 0 && places * onePlace > kMaxStagingBytes) {
+    const uint64_t capped = (kMaxStagingBytes / onePlace) & ~uint64_t{1};
+    places = std::min(places, std::max<uint64_t>(2 * uint64_t{kAheadReaders}, capped));
+  }
+  return {g.placeBytes, static_cast<uint32_t>(std::max<uint64_t>(2, places))};
 }
 
 // The shape a decode step's prediction of the next block's routes selects
@@ -363,9 +374,13 @@ struct ExpertStore::Impl {
     return std::min<uint64_t>(shape.experts, uint64_t{rows} * shape.expertsPerToken);
   }
   // The places a round of a load of `rows` rows stages: every place for a
-  // cycle's load, which they hold, else half of them.
+  // cycle's load when staging holds every routable expert, else leaving room
+  // for up to kAheadReaders unrouted read-aheads still finishing a piece;
+  // half of them for longer loads.
   [[nodiscard]] uint32_t roundPlaces(uint32_t rows) const noexcept {
-    return cycleLoad(rows) ? places.count : places.count / 2;
+    if (!cycleLoad(rows)) return places.count / 2;
+    if (places.count >= routable(rows)) return places.count;
+    return places.count > kAheadReaders ? places.count - kAheadReaders : 1;
   }
   [[nodiscard]] bool streams(uint32_t block) const noexcept { return sizes[blocks[block].size].streams; }
   // Adds to `reads` a group of the experts from `expert` on at the places
@@ -664,6 +679,7 @@ void ExpertStore::Impl::stage(uint32_t index, uint32_t capacity, ExpertStoreStat
   const std::vector<Piece> &aheadPieces = ahead.reads.pieces;
   const SsdReaders::Batch *batch = ahead.batch.get();
   const auto reading = [&](size_t piece) { return piece < batch->taken() && !batch->ended(piece); };
+  uint32_t unroutedBusy = 0;
   for (size_t piece = 0, end = 0; batch && piece < aheadPieces.size(); piece = end) {
     const uint32_t at = aheadPieces[piece].group;
     const Group &group = ahead.reads.groups[at];
@@ -676,6 +692,7 @@ void ExpertStore::Impl::stage(uint32_t index, uint32_t capacity, ExpertStoreStat
     }
     if (!ended) {
       taken[group.place] = 1;
+      ++unroutedBusy;
       continue;
     }
     countAhead(at, piece, end);
@@ -695,6 +712,18 @@ void ExpertStore::Impl::stage(uint32_t index, uint32_t capacity, ExpertStoreStat
   }
   const uint64_t left = std::ranges::count_if(pending, [&](const auto &entry) { return waiting[entry.first]; });
   const uint64_t due = std::max<uint64_t>(staged.size(), std::min<uint64_t>(capacity, staged.size() + left));
+  if (unroutedBusy && due > places.count - unroutedBusy) {
+    for (size_t piece = 0, end = 0; piece < aheadPieces.size(); piece = end) {
+      const uint32_t at = aheadPieces[piece].group;
+      const Group &group = ahead.reads.groups[at];
+      while (end < aheadPieces.size() && aheadPieces[end].group == at) ++end;
+      if (ahead.counted[at]) continue;
+      for (size_t rest = piece; rest < end; ++rest)
+        while (reading(rest)) std::this_thread::yield();
+      countAhead(at, piece, end);
+      taken[group.place] = 0;
+    }
+  }
   uint32_t place = 0;
   for (size_t at = 0; at < pending.size() && staged.size() < due;) {
     if (!waiting[pending[at].first]) {

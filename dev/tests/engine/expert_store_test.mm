@@ -2022,6 +2022,126 @@ int streamedSourceChanges(const std::string &metallibPath, const MoeShape &shape
   return 0;
 }
 
+// A model whose uncapped staging would exceed the 320 MiB cap (32 Q8_0 experts
+// of 2048x2048, ~13.4 MiB/place -> ~429 MiB uncapped) caps its staging to an
+// even place count <= 320 MiB (22 places). Cycle loads whose routable experts
+// exceed the capped places (decode 4 lanes -> 32 > 22) load in multiple rounds
+// leaving headroom for in-flight read-aheads; cycle loads near the cap
+// (5 rows -> 20 <= 22) stay 1 round even under unrouted read-aheads; and
+// prefill chunks split across half-staging rounds. Every step gives the
+// resident experts' bits.
+int streamedCappedStaging(MetalBackend &backend, const std::filesystem::path &directory) {
+  constexpr MoeShape shape{2048, 48, 4, 2048};
+  constexpr uint64_t kCap = 320ULL << 20;
+  constexpr uint64_t kAhead = 4;
+  const Model m = makeModel(backend, shape, Q80, true);
+  ExpertFile file(m, directory / "capped.bin");
+  const uint64_t slots = shape.experts;
+  ExpertStore store(backend, file.blocks, shape, storeOptions(arenaBytes(m, slots) + kSpareBytes, file.blocks, shape));
+  growToCap(store);
+  const uint64_t stagingBytes = store.stats().stagingBytes;
+  uint64_t onePlace = 0;
+  for (size_t p = 0; p < 3; ++p) {
+    const uint64_t rows = m.routed[p].rows / shape.experts;
+    const uint64_t staged = rows * rowBytes(m.formats[p], m.routed[p].columns);
+    onePlace += ((staged + 16383) & ~uint64_t{16383}) + 16384;
+  }
+  const uint64_t expectedPlaces = (kCap / onePlace) & ~uint64_t{1};
+  int failures = 0;
+  if (expectedPlaces >= shape.experts || stagingBytes > kCap || stagingBytes < expectedPlaces * onePlace) {
+    printf("  capped staging: stagingBytes=%llu MiB, expectedPlaces=%llu of %u (onePlace=%llu KiB) FAIL\n",
+           (unsigned long long)(stagingBytes >> 20), (unsigned long long)expectedPlaces, shape.experts,
+           (unsigned long long)(onePlace >> 10));
+    return 1;
+  }
+  std::array<BlockMoeWeights, 2> streamed{m.weights, m.weights};
+  for (uint32_t block = 0; block < 2; ++block) store.bind(block, streamed[block]);
+  Buffers b;
+  // decode(4 lanes=32 rows): routable=48 > expectedPlaces(32) -> 2 rounds reserving kAhead.
+  // decode(1 lane=8 rows): routable=32 == expectedPlaces(32) < experts(48) -> 1 round (Boundary 2).
+  // prefill(kMaximumRows): half-staging rounds.
+  const StepPlan plans[] = {decodeStep(shape, 4), decodeStep(shape, 1, 8), prefillStep(shape, kMaximumRows)};
+  for (const StepPlan &step : plans) {
+    const uint32_t rows = step.plan.rows();
+    const uint64_t routable = std::min<uint64_t>(shape.experts, uint64_t{rows} * shape.expertsPerToken);
+    const uint64_t perRound = rows <= 32 ? (expectedPlaces >= routable ? expectedPlaces : expectedPlaces - kAhead)
+                                         : expectedPlaces / 2;
+    const size_t useIndex = step.lanes ? 1 : 0;
+    for (uint32_t block = 0; block < 2; ++block) {
+      // Fresh rows on block 1 too so block 0's read-ahead includes unrouted experts.
+      freshRows(backend, b, shape);
+      const std::vector<uint16_t> want = runWeights(backend, m.weights, b, step);
+      const ExpertStoreStats::Use before = store.stats().uses[useIndex];
+      const std::vector<uint16_t> got = runWeights(backend, streamed[block], b, step);
+      const ExpertStoreStats::Use &after = store.stats().uses[useIndex];
+      const uint64_t expectedRounds =
+          (routable + perRound - 1) / perRound + (longChunk(shape, rows) && block == 0);
+      const uint64_t hostSteps = after.pickup.count - before.pickup.count;
+      if (got != want || !slotsHoldTheirExperts(m, streamed[block], b, step.plan) || hostSteps != expectedRounds ||
+          !store.stats().failure.empty()) {
+        printf("  capped staging rows=%u block=%u: %llu host steps (want %llu), failure=\"%s\", or output differs FAIL\n",
+               rows, block, (unsigned long long)hostSteps, (unsigned long long)expectedRounds,
+               store.stats().failure.c_str());
+        ++failures;
+      }
+    }
+  }
+  printf("streamed experts: capped staging (%llu places, %.1f MiB <= 320 MiB) multi-round decode/prefill under "
+         "read-ahead: bitwise the resident experts' %s\n",
+         (unsigned long long)expectedPlaces, double(stagingBytes) / (1 << 20), failures ? "FAIL" : "ok");
+  return failures;
+}
+
+// Verify Nemotron-3.5 Bolt's widest MoE geometry (496 experts, top 9, 1024x2560
+// ungated IQ2_XXS) has its staging capped cleanly below 320 MiB (288 -> 238
+// places, 387 -> 320 MiB), while smaller models stay uncapped.
+int streamedBoltStagingGeometry() {
+  constexpr uint64_t kCap = 320ULL << 20;
+  constexpr MoeShape bolt{.hiddenSize = 1024,
+                          .experts = 496,
+                          .expertsPerToken = 9,
+                          .expertIntermediateSize = 2560,
+                          .router = splash::ops::MoeRouter::SigmoidBiased,
+                          .sharedSlices = 0,
+                          .sharedGate = false,
+                          .activation = splash::ops::MoeActivation::ReluSquared,
+                          .routerInputSize = 4096,
+                          .routedScale = 5.0f};
+  splash::model::gguf::StreamedExperts experts;
+  // Ungated ReLU^2: gate has 0 rows; up is 2560x1024 and down is 1024x2560 in IQ2_XXS.
+  experts.projections[1].format = IQ2XXS;
+  experts.projections[1].rows = uint64_t{bolt.experts} * bolt.expertIntermediateSize;
+  experts.projections[1].columns = bolt.hiddenSize;
+  experts.projections[2].format = IQ2XXS;
+  experts.projections[2].rows = uint64_t{bolt.experts} * bolt.hiddenSize;
+  experts.projections[2].columns = bolt.expertIntermediateSize;
+  StreamedBlocks blocks;
+  blocks.blocks = {experts, experts};
+  const uint64_t fixed = ExpertStore::fixedBytes(blocks, bolt);
+  // fixedBytes = staging + slotTables + jobs + prediction; staging dominates (~320 MiB).
+  const uint64_t oneUp = ((uint64_t{bolt.expertIntermediateSize} * rowBytes(IQ2XXS, bolt.hiddenSize) + 16383) &
+                          ~uint64_t{16383}) +
+                         16384;
+  const uint64_t oneDown = ((uint64_t{bolt.hiddenSize} * rowBytes(IQ2XXS, bolt.expertIntermediateSize) + 16383) &
+                            ~uint64_t{16383}) +
+                           16384;
+  const uint64_t onePlace = oneUp + oneDown;
+  const uint64_t uncappedPlaces = std::min<uint64_t>(bolt.experts, 32ULL * bolt.expertsPerToken);
+  const uint64_t cappedPlaces = (kCap / onePlace) & ~uint64_t{1};
+  if (uncappedPlaces != 288 || cappedPlaces != 238 || fixed > kCap + (8ULL << 20) ||
+      fixed < cappedPlaces * onePlace) {
+    printf("  bolt staging geometry: uncapped=%llu, capped=%llu, fixed=%.1f MiB FAIL\n",
+           (unsigned long long)uncappedPlaces, (unsigned long long)cappedPlaces, double(fixed) / (1 << 20));
+    return 1;
+  }
+  printf("streamed experts: Bolt widest MoE (496x9, 1024x2560 IQ2_XXS) staging capped %llu -> %llu places "
+         "(%.1f -> %.1f MiB, fixed %.1f MiB) ok\n",
+         (unsigned long long)uncappedPlaces, (unsigned long long)cappedPlaces,
+         double(uncappedPlaces * onePlace) / (1 << 20), double(cappedPlaces * onePlace) / (1 << 20),
+         double(fixed) / (1 << 20));
+  return 0;
+}
+
 } // namespace
 
 int main(int argc, const char *argv[]) {
@@ -2056,6 +2176,7 @@ int main(int argc, const char *argv[]) {
                     streamedSourceChanges(argv[1], shape, directory.path());
       }
       failures += streamedLatentBlocks(backend, directory.path());
+      failures += streamedCappedStaging(backend, directory.path()) + streamedBoltStagingGeometry();
       printf("%u experts, top %u, hidden %u, %u wide:\n", kFlashNextExperts.experts, kFlashNextExperts.expertsPerToken,
              kFlashNextExperts.hiddenSize, kFlashNextExperts.expertIntermediateSize);
       failures += streamedExperts(backend, kFlashNextExperts, directory.path(), {{Q20, false}});
